@@ -1,0 +1,12 @@
+cff-version: 1.2.0
+message: "If you use this code, please cite it using the metadata below."
+title: "Analysis code for \"Surface–air temperature difference signals water–energy constraints on vegetation carbon uptake\""
+authors:
+  - family-names: Wang
+    given-names: Wenhao
+    # orcid: "https://orcid.org/0000-0000-0000-0000"   # <- add your ORCID if desired
+version: v1.0.1
+doi: 10.5281/zenodo.21276954
+date-released: 2026-07-09
+url: "https://github.com/1117wwh/tsta-gpp-code"
+license: MIT

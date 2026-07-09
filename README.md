@@ -1,3 +1,5 @@
+[![DOI](https://zenodo.org/badge/1291691278.svg)](https://doi.org/10.5281/zenodo.21276954)
+
 # Analysis code for "Surface–air temperature difference signals water–energy constraints on vegetation carbon uptake"
 
 This repository contains the core analysis code used to quantify the sensitivity
