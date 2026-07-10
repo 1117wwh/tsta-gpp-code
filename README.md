@@ -114,6 +114,27 @@ upstream of `01a`/`01b` follow the Methods and are not reproduced here.
 
 ---
 
+## Figure source data
+
+For convenience and reproducibility, the numerical source data underlying the
+figures are included in this repository:
+
+* `source_data/` — one CSV per figure panel plus `README_SourceData.md`, which
+  documents every file (variables, units, time range and missing-value coding).
+  Covers Figs 1–5 and Supplementary Figs 1 and 3–6 (map-only panels are not
+  tabulated).
+* `supplementary_data/Supplementary Data 1.xlsx` — the 240 FLUXNET sites used in
+  the analysis, with their key attributes, valid records and derived Ts−Ta
+  sensitivities.
+
+**Licensing.** The **code** in this repository is released under the MIT License
+(see `LICENSE`). The **data** files under `source_data/` and `supplementary_data/`
+are derived products shared for reproducibility under a Creative Commons
+Attribution 4.0 (CC-BY-4.0) license; the underlying FLUXNET observations remain
+subject to the FLUXNET data policy.
+
+---
+
 ## Requirements
 
 Tested with:
