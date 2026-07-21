@@ -1,6 +1,4 @@
-[![DOI](https://zenodo.org/badge/1291691278.svg)](https://doi.org/10.5281/zenodo.21276954)
-
-# Analysis code for "Surface–air temperature difference signals water–energy constraints on vegetation carbon uptake"
+# Analysis code
 
 This repository contains the core analysis code used to quantify the sensitivity
 of gross primary productivity (GPP) to the surface–air temperature difference
@@ -92,8 +90,8 @@ differenced between adjacent years and regressed pixel-by-pixel
 **Ts−Ta-associated GPP change (05).** For each year, dGPP = β × [Ts−Ta_annual −
 baseline], where the baseline is the 2001–2003 mean of annual Ts−Ta. Per-pixel
 maps are written and summarized as cos-latitude area-weighted means over global
-vegetated land, drylands (AI < 0.65) and humid regions (AI ≥ 0.65), with linear
-trends and the 2023 total in Pg C.
+vegetated land, water-limited (AI < 1) and energy-limited (AI ≥ 1) regions, with
+linear trends and the 2023 total in Pg C.
 
 ---
 
@@ -111,27 +109,6 @@ Ts−Ta is computed from ERA5-Land skin temperature and 2 m air temperature over
 10:00–14:00 local-time (midday) window and aggregated to 8-day composites; VPD is
 derived from 2 m temperature and dew point. These variable-preparation steps
 upstream of `01a`/`01b` follow the Methods and are not reproduced here.
-
----
-
-## Figure source data
-
-For convenience and reproducibility, the numerical source data underlying the
-figures are included in this repository:
-
-* `source_data/` — one CSV per figure panel plus `README_SourceData.md`, which
-  documents every file (variables, units, time range and missing-value coding).
-  Covers Figs 1–5 and Supplementary Figs 1 and 3–6 (map-only panels are not
-  tabulated).
-* `supplementary_data/Supplementary Data 1.xlsx` — the 240 FLUXNET sites used in
-  the analysis, with their key attributes, valid records and derived Ts−Ta
-  sensitivities.
-
-**Licensing.** The **code** in this repository is released under the MIT License
-(see `LICENSE`). The **data** files under `source_data/` and `supplementary_data/`
-are derived products shared for reproducibility under a Creative Commons
-Attribution 4.0 (CC-BY-4.0) license; the underlying FLUXNET observations remain
-subject to the FLUXNET data policy.
 
 ---
 
