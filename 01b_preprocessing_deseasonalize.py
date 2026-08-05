@@ -68,7 +68,12 @@ VAR_FILENAME = {
 
 PREPROC_ROOT = r"D:\DATA\FDI_PREPROC_TIME"
 TEMP_DIR = tempfile.gettempdir()
-VEG_PATH = r"C:\Users\dell\Downloads\GEE_MCD12Q1-20260304T024357Z-3-001\GEE_MCD12Q1\Vegetation_Merged\MCD12Q1_2012_0p1deg_veg.tif"
+# Multi-year (2001--2023) modal MCD12Q1 mask, aligned to the GPP/Fig. 1 grid.
+VEG_PATH = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)),
+    "Vegetation_Mask",
+    "MCD12Q1_2001_2023_mode_veg5_aligned_to_Fig1.tif",
+)
 VALID_VEG_IDS = (1, 2, 3, 4, 5)
 
 
