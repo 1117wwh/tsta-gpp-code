@@ -1,6 +1,6 @@
 cff-version: 1.2.0
 message: "If you use this code, please cite it using the metadata below."
-title: "Analysis code for \"Surface–air temperature difference signals water–energy constraints on vegetation carbon uptake\""
+title: "Analysis code"
 authors:
   - family-names: Wang
     given-names: Wenhao
