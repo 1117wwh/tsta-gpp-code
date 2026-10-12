@@ -1,383 +1,320 @@
-# -*- coding: utf-8 -*-
-r"""
-Pathway decomposition of GPP sensitivity to Ts-Ta (Fig. 3 and Fig. 4).
+"""Calculate VPD, soil-moisture and temperature pathways with a paired year bootstrap."""
 
-The observed sensitivity of GPP to Ts-Ta is partitioned into three pathways
-associated with atmospheric water demand (VPD), soil water supply (SM) and
-background thermal conditions (T2M). All variables are standardized anomalies
-from 01a. For each pixel:
-
-  1. alpha_E : covariation of each mediator with Ts-Ta, from simple regressions
-               E ~ Ts-Ta   (E in {VPD, SM, T2M}).
-  2. beta_E  : partial effect of each mediator on GPP, from one multiple
-               regression   GPP ~ VPD + SM + T2M.
-  3. C_E = alpha_E * beta_E : the contribution of pathway E.
-     The reconstructed sensitivity is C_VPD + C_SM + C_T2M (used in Fig. 4).
-
-Multicollinearity among VPD, SM and T2M is screened with variance inflation
-factors (VIF). Implementation note: after reading, each variable stack is written
-to a memory-mapped file so that every parallel worker maps only the one image row
-it needs, keeping memory use flat regardless of the number of workers.
-
-Inputs : standardized anomalies from 01a ({PREPROC_ROOT}\{VAR}_ZSCORE for
-         GPP, TSTA, VPD, SM, T2M).
-Outputs: per-pixel alpha/beta maps, pathway contributions C_VPD/C_SM/C_T2M,
-         dominant pathway, relative contributions, R^2 and VIF diagnostics,
-         written to {OUT_DIR}.
-"""
-
-import os
-import gc
-import tempfile
+from pathlib import Path
+import json
+import re
 import warnings
 import numpy as np
 import rasterio
-from scipy import stats
-from joblib import Parallel, delayed
-from tqdm import tqdm
+from rasterio.transform import from_origin
+from scipy.stats import t as student_t
 
-warnings.filterwarnings("ignore")
+CODE_DIR = Path(__file__).resolve().parent
+YEARS = list(range(2001, 2024))
+GRID_SHAPE = (180, 360)
+GRID_TRANSFORM = from_origin(-180, 90, 1, 1)
+OVERWRITE = False
 
-# ==================== Configuration ====================
-PREPROC_ROOT = r"D:\DATA\FDI_PREPROC2"
-OUTPUT_ROOT = r"C:\Users\dell\Desktop\EIS"
-
-# Ts-Ta temporal window. NOON is the main analysis; DAYTIME / ALLDAY are optional
-# robustness variants. The names map to the folders written by 01a.
-TSTA_WINDOW = "NOON"
-TSTA_VAR_BY_WINDOW = {
-    "NOON": "TSTA",
-    "DAYTIME": "TSTA_DAYTIME",
-    "ALLDAY": "TSTA_ALLDAY",
+STANDARDIZED_DIR = CODE_DIR / "outputs/01_standardized"
+MONTHLY_DIR = Path("D:/DATA/TTS-GPP/STANDARDIZED/1deg_monthly")
+DATASETS = {
+    "GOSIF_GPP_8day": {
+        "scale": "8day",
+        "TSS": STANDARDIZED_DIR / "TSS_8day",
+        "response": STANDARDIZED_DIR / "GOSIF_GPP_8day",
+        "VPD": STANDARDIZED_DIR / "VPD_8day",
+        "SM": STANDARDIZED_DIR / "SM_8day",
+        "Ta": STANDARDIZED_DIR / "Ta_8day",
+    },
+    "GloFlux_GPP_monthly": {
+        "scale": "monthly",
+        "TSS": STANDARDIZED_DIR / "TSS_monthly",
+        "response": MONTHLY_DIR / "GLOFLUX_GPP_MONTH_ZSCORE",
+        "VPD": MONTHLY_DIR / "ERA5Land_VPD_MONTH_ZSCORE",
+        "SM": MONTHLY_DIR / "ERA5Land_SM_MONTH_ZSCORE",
+        "Ta": MONTHLY_DIR / "ERA5Land_TA_ALLDAY_MONTH_ZSCORE",
+    },
 }
-TSTA_PREFIX = TSTA_VAR_BY_WINDOW[TSTA_WINDOW]
-TSTA_DIR = os.path.join(PREPROC_ROOT, f"{TSTA_PREFIX}_ZSCORE")
 
-# GPP (GOSIF GPP) is the response variable.
-GPP_PREFIX = "GPP"
-GPP_DIR = os.path.join(PREPROC_ROOT, "GPP_ZSCORE")
-
-VPD_DIR = os.path.join(PREPROC_ROOT, "VPD_ZSCORE")
-SM_DIR = os.path.join(PREPROC_ROOT, "SM_ZSCORE")
-T2M_DIR = os.path.join(PREPROC_ROOT, "T2M_ZSCORE")
-
-OUT_SUFFIX = "" if TSTA_WINDOW == "NOON" else f"_{TSTA_WINDOW}"
-OUT_DIR = os.path.join(OUTPUT_ROOT, "Pathway_Decomposition_Final2" + OUT_SUFFIX)
-os.makedirs(OUT_DIR, exist_ok=True)
-
-YEARS = range(2001, 2024)
-MIN_SAMPLES = 150
-VIF_THRESHOLD = 10
-NUM_JOBS = 40
-TEMP_DIR = r"D:\DATA\TEMP_MMAP"
-os.makedirs(TEMP_DIR, exist_ok=True)
-
-
-# ==================== Utilities ====================
-
-def get_path(var_dir, prefix, year, doy):
-    return os.path.join(var_dir, f"{prefix}_ZSCORE_{year}_{doy:03d}.tif")
+OUTPUT_DIR = CODE_DIR / "outputs/03_pathways"
+BOOTSTRAP_REPEATS = 1999
+BOOTSTRAP_SEED = 20260917
+PIXELS_PER_BATCH = 64
+VARIABLES = ["TSS", "response", "VPD", "SM", "Ta"]
+METRICS = [
+    "a_VPD",
+    "a_SM",
+    "a_Ta",
+    "b_VPD",
+    "b_SM",
+    "b_Ta",
+    "C_VPD",
+    "C_SM",
+    "C_thermal",
+    "C_water",
+    "S_recon",
+    "S_direct",
+    "C_water_minus_thermal",
+]
+PRODUCT_PAIRS = [(first, second) for first in range(5) for second in range(first, 5)]
 
 
-def read_tif(path):
-    with rasterio.open(path) as src:
-        arr = src.read(1).astype(np.float32)
-        if src.nodata is not None and np.isfinite(src.nodata):
-            arr[arr == src.nodata] = np.nan
-        arr[arr == 65534] = np.nan
-        arr[arr == 65535] = np.nan
-    return arr
+def read_raster(path):
+    with rasterio.open(path) as source:
+        if (
+            source.shape != GRID_SHAPE
+            or source.count != 1
+            or source.crs != rasterio.crs.CRS.from_epsg(4326)
+            or not np.allclose(tuple(source.transform), tuple(GRID_TRANSFORM), rtol=0, atol=1e-9)
+        ):
+            raise ValueError(f"Expected an aligned global 1-degree EPSG:4326 raster: {path}")
+        values = source.read(1, masked=True).astype("float64").filled(np.nan)
+    values[~np.isfinite(values)] = np.nan
+    return values
 
 
-def save_tif(arr, filename, profile):
-    path = os.path.join(OUT_DIR, filename)
-    p = profile.copy()
-    p.update(dtype="float32", count=1, nodata=np.nan, compress="lzw")
-    with rasterio.open(path, "w", **p) as dst:
-        dst.write(arr.astype(np.float32), 1)
-    print(f"  Saved: {filename}")
+def write_raster(path, values, description):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with rasterio.open(
+        path,
+        "w",
+        driver="GTiff",
+        height=180,
+        width=360,
+        count=1,
+        dtype=str(values.dtype),
+        crs="EPSG:4326",
+        transform=GRID_TRANSFORM,
+        nodata=np.nan,
+        compress="deflate",
+        predictor=3,
+    ) as output:
+        output.write(values, 1)
+        output.set_band_description(1, description)
+        output.update_tags(years=f"{YEARS[0]}-{YEARS[-1]}", resolution="1 degree")
 
 
-def calculate_vif(X):
-    n, k = X.shape
-    vif = []
-    for i in range(k):
-        mask = np.ones(k, dtype=bool)
-        mask[i] = False
-        X_reg = np.column_stack([np.ones(n), X[:, mask]])
-        coefs, _, _, _ = np.linalg.lstsq(X_reg, X[:, i], rcond=None)
-        y_pred = X_reg @ coefs
-        ss_res = np.sum((X[:, i] - y_pred) ** 2)
-        ss_tot = np.sum((X[:, i] - np.mean(X[:, i])) ** 2)
-        r2 = 1 - ss_res / ss_tot if ss_tot > 1e-12 else 0
-        vif.append(1.0 / (1.0 - r2) if r2 < 0.999 else np.inf)
-    return np.array(vif)
+def prepare_output(directory):
+    if directory.exists() and any(directory.iterdir()) and not OVERWRITE:
+        raise FileExistsError(f"Results already exist. Change OUTPUT_DIR or set OVERWRITE=True: {directory}")
+    directory.mkdir(parents=True, exist_ok=True)
 
 
-# ==================== Per-row worker ====================
-
-def _row_worker(row_idx,
-                tsta_path, gpp_path, vpd_path, sm_path, t2m_path,
-                shape, min_samples, vif_threshold):
-    """Each worker maps only the single image row it needs from each memmap."""
-    T, H, W = shape
-
-    def load_row(path):
-        mm = np.memmap(path, dtype="float32", mode="r", shape=shape)
-        row = mm[:, row_idx, :].copy()
-        del mm
-        return row
-
-    tsta_row = load_row(tsta_path)
-    gpp_row = load_row(gpp_path)
-    vpd_row = load_row(vpd_path)
-    sm_row = load_row(sm_path)
-    t2m_row = load_row(t2m_path)
-
-    def empty():
-        return np.full(W, np.nan, dtype=np.float32)
-
-    alpha1, alpha2, alpha3 = empty(), empty(), empty()
-    beta1, beta2, beta3 = empty(), empty(), empty()
-    c_vpd, c_sm, c_t2m = empty(), empty(), empty()
-    dominant = empty()
-    c_dominant = empty()
-    rel_vpd, rel_sm, rel_t2m = empty(), empty(), empty()
-    r_squared = empty()
-    vif_max = empty()
-    valid_flag = empty()
-
-    for col in range(W):
-        ts = tsta_row[:, col]
-        gpp = gpp_row[:, col]
-        vpd = vpd_row[:, col]
-        sm = sm_row[:, col]
-        t2m = t2m_row[:, col]
-
-        valid = (np.isfinite(ts) & np.isfinite(gpp) &
-                 np.isfinite(vpd) & np.isfinite(sm) & np.isfinite(t2m))
-        n = valid.sum()
-        if n < min_samples:
+def index_rasters(directory, pattern, time_scale):
+    periods = list(range(1, 366, 8)) if time_scale == "8day" else list(range(1, 13))
+    expected = [(year, period) for year in YEARS for period in periods]
+    paths = {}
+    for path in sorted(directory.rglob("*.tif")):
+        match = re.search(pattern, path.name)
+        if match is None:
             continue
-
-        ts_v = ts[valid]; gpp_v = gpp[valid]
-        vpd_v = vpd[valid]; sm_v = sm[valid]; t2m_v = t2m[valid]
-
-        # Step 1: simple regressions -> alpha (Ts-Ta -> mediator covariation)
-        a1, _, _, _, _ = stats.linregress(ts_v, vpd_v)
-        a2, _, _, _, _ = stats.linregress(ts_v, sm_v)
-        a3, _, _, _, _ = stats.linregress(ts_v, t2m_v)
-        alpha1[col], alpha2[col], alpha3[col] = a1, a2, a3
-
-        # Step 2: VIF screening
-        X_vars = np.column_stack([vpd_v, sm_v, t2m_v])
-        vif_vals = calculate_vif(X_vars)
-        vmax = float(np.max(vif_vals))
-        vif_max[col] = vmax
-        if vmax > vif_threshold:
-            valid_flag[col] = 0
+        year, period = int(match["year"]), int(match["period"])
+        if year not in YEARS:
             continue
-        valid_flag[col] = 1
-
-        # Step 3: multiple regression -> beta (partial mediator -> GPP effects)
-        X = np.column_stack([np.ones(n), vpd_v, sm_v, t2m_v])
-        try:
-            coefs, _, _, _ = np.linalg.lstsq(X, gpp_v, rcond=None)
-            b1, b2, b3 = float(coefs[1]), float(coefs[2]), float(coefs[3])
-            y_pred = X @ coefs
-            ss_res = np.sum((gpp_v - y_pred) ** 2)
-            ss_tot = np.sum((gpp_v - np.mean(gpp_v)) ** 2)
-            r2 = float(1 - ss_res / ss_tot) if ss_tot > 1e-12 else 0.0
-        except Exception:
-            continue
-
-        beta1[col], beta2[col], beta3[col] = b1, b2, b3
-        r_squared[col] = r2
-
-        # Step 4: pathway contributions (sign preserved)
-        cv, cs, ct = a1 * b1, a2 * b2, a3 * b3
-        c_vpd[col], c_sm[col], c_t2m[col] = cv, cs, ct
-
-        # Step 5: dominant pathway
-        abs_c = np.array([abs(cv), abs(cs), abs(ct)])
-        total_abs = abs_c.sum()
-        if total_abs > 1e-10:
-            dom_idx = int(np.argmax(abs_c))
-            dominant[col] = dom_idx + 1
-            c_dominant[col] = [cv, cs, ct][dom_idx]
-            rel_vpd[col], rel_sm[col], rel_t2m[col] = abs_c / total_abs
-
-    return (row_idx,
-            alpha1, alpha2, alpha3,
-            beta1, beta2, beta3,
-            c_vpd, c_sm, c_t2m,
-            dominant, c_dominant,
-            rel_vpd, rel_sm, rel_t2m,
-            r_squared, vif_max, valid_flag)
+        if period not in periods or (year, period) in paths:
+            raise ValueError(f"Invalid or duplicate date: {path}")
+        paths[year, period] = path
+    missing = sorted(set(expected) - set(paths))
+    if missing:
+        raise ValueError(f"Missing {len(missing)} raster dates in {directory}: {missing[:5]}")
+    return {key: paths[key] for key in expected}
 
 
-# ==================== Main ====================
+def load_series(directory, time_scale):
+    paths = index_rasters(directory, r"_(?P<year>20\d{2})_(?P<period>\d{2,3})_1deg\.tif$", time_scale)
+    values = np.empty((len(paths), 180 * 360), dtype=np.float32)
+    for index, path in enumerate(paths.values()):
+        values[index] = read_raster(path).ravel()
+    print(f"Read {len(paths)} full rasters: {directory}", flush=True)
+    return values
+
+
+def save_pixel_map(directory, name, values, pixels):
+    grid = np.full(GRID_SHAPE, np.nan, dtype=np.float64)
+    grid.ravel()[pixels] = values
+    write_raster(directory / f"{name}_1deg.tif", grid, name)
+
+
+def fit_regression(predictors, response, lags, minimum_samples):
+    valid = np.isfinite(response) & np.isfinite(predictors).all(axis=1)
+    count = int(valid.sum())
+    design = np.column_stack([np.ones(len(response)), predictors])
+    fitted_design = design[valid]
+    observed = response[valid]
+    parameters = design.shape[1]
+    if count < max(minimum_samples, parameters + 1) or np.linalg.matrix_rank(fitted_design) < parameters:
+        return None
+    coefficients = np.linalg.lstsq(fitted_design, observed, rcond=None)[0]
+    residual = observed - fitted_design @ coefficients
+    inverse_gram = np.linalg.inv(fitted_design.T @ fitted_design)
+    # Keep missing dates in the time axis when computing HAC lagged products.
+    scores = np.zeros_like(design)
+    scores[valid] = fitted_design * residual[:, None]
+    score_covariance = scores.T @ scores
+    for lag in range(1, min(lags, len(response) - 1) + 1):
+        cross_product = scores[lag:].T @ scores[:-lag]
+        weight = 1 - lag / (lags + 1)
+        score_covariance += weight * (cross_product + cross_product.T)
+    covariance = inverse_gram @ score_covariance @ inverse_gram * count / (count - parameters)
+    standard_error = np.sqrt(np.maximum(np.diag(covariance), 0))
+    with np.errstate(divide="ignore", invalid="ignore"):
+        p_value = 2 * student_t.sf(abs(coefficients / standard_error), count - parameters)
+    total_variation = np.sum((observed - observed.mean()) ** 2)
+    r_squared = 1 - np.sum(residual**2) / total_variation if total_variation > 0 else np.nan
+    return coefficients, standard_error, p_value, count, r_squared
+
+
+def annual_statistics(values, periods_per_year, paired_only=False):
+    # Each year has a count, five variable sums and 15 unique cross-products.
+    statistics = np.zeros((len(YEARS), values.shape[1], 21))
+    for index, year in enumerate(YEARS):
+        yearly = values[index * periods_per_year : (index + 1) * periods_per_year].astype(float)
+        checked = yearly[:, :, :2] if paired_only else yearly
+        valid = np.isfinite(checked).all(axis=2)
+        yearly = np.where(valid[:, :, None], np.nan_to_num(yearly, nan=0), 0)
+        statistics[index, :, 0] = valid.sum(axis=0)
+        statistics[index, :, 1:6] = yearly.sum(axis=0)
+        for column, (first, second) in enumerate(PRODUCT_PAIRS):
+            statistics[index, :, 6 + column] = (yearly[:, :, first] * yearly[:, :, second]).sum(axis=0)
+    return statistics
+
+
+def fit_pathways(statistics, paired_statistics):
+    count = statistics[..., 0]
+    sums = statistics[..., 1:6]
+    centered_products = np.empty((*count.shape, 5, 5))
+    for column, (first, second) in enumerate(PRODUCT_PAIRS):
+        centered = statistics[..., 6 + column] - sums[..., first] * sums[..., second] / np.maximum(count, 1)
+        centered_products[..., first, second] = centered
+        centered_products[..., second, first] = centered
+    environmental_products = centered_products[..., 2:, 2:]
+    eigenvalues = np.linalg.eigvalsh(environmental_products)
+    valid = (
+        (count >= 5)
+        & (centered_products[..., 0, 0] > 1e-12)
+        & (eigenvalues[..., 0] > 1e-10 * np.maximum(eigenvalues[..., -1], 1))
+    )
+    safe_products = np.where(valid[..., None, None], environmental_products, np.eye(3))
+    beta = np.linalg.solve(safe_products, centered_products[..., 2:, 1, None])[..., 0]
+    alpha = centered_products[..., 0, 2:] / np.maximum(centered_products[..., 0, 0, None], 1e-30)
+    contribution = alpha * beta
+    pair_count = paired_statistics[..., 0]
+    pair_sums = paired_statistics[..., 1:6]
+    with np.errstate(divide="ignore", invalid="ignore"):
+        direct = (paired_statistics[..., 7] - pair_sums[..., 0] * pair_sums[..., 1] / pair_count) / (
+            paired_statistics[..., 6] - pair_sums[..., 0] ** 2 / pair_count
+        )
+    water = contribution[..., :2].sum(axis=-1)
+    reconstruction = contribution.sum(axis=-1)
+    results = np.concatenate(
+        [
+            alpha,
+            beta,
+            contribution,
+            water[..., None],
+            reconstruction[..., None],
+            direct[..., None],
+            (water - contribution[..., 2])[..., None],
+        ],
+        axis=-1,
+    )
+    return np.where(valid[..., None], results, np.nan)
+
 
 def main():
-    print("=" * 60)
-    print("Pathway decomposition: Ts-Ta -> [VPD / SM / T2M] -> GPP")
-    print(f"Ts-Ta window : {TSTA_WINDOW}")
-    print(f"Ts-Ta dir    : {TSTA_DIR}")
-    print(f"GPP dir      : {GPP_DIR}")
-    print(f"Output dir   : {OUT_DIR}")
-    print(f"Years        : {YEARS.start}-{YEARS.stop - 1}")
-    print(f"Min samples  : {MIN_SAMPLES}  VIF threshold: {VIF_THRESHOLD}  jobs: {NUM_JOBS}")
-    print("=" * 60)
-
-    # Build the list of time steps for which all five variables exist.
-    time_list = []
-    for year in YEARS:
-        for doy in range(1, 367, 8):
-            files = [
-                get_path(TSTA_DIR, TSTA_PREFIX, year, doy),
-                get_path(GPP_DIR, GPP_PREFIX, year, doy),
-                get_path(VPD_DIR, "VPD", year, doy),
-                get_path(SM_DIR, "SM", year, doy),
-                get_path(T2M_DIR, "T2M", year, doy),
-            ]
-            if all(os.path.exists(f) for f in files):
-                time_list.append(tuple(files))
-
-    print(f"Valid time steps: {len(time_list)}")
-    if not time_list:
-        raise RuntimeError("No valid files found; check the path configuration.")
-
-    with rasterio.open(time_list[0][0]) as src:
-        profile = src.profile.copy()
-        H, W = src.height, src.width
-    T = len(time_list)
-    shape = (T, H, W)
-    print(f"Grid size: {H}x{W}  time steps: {T}")
-    print(f"Per-variable memmap size: {T * H * W * 4 / 1024 ** 3:.2f} GB")
-    print(f"Per-worker memory increment: ~{T * W * 5 * 4 / 1024 ** 2:.0f} MB")
-
-    # Read each variable into a memory-mapped file (one large array at a time).
-    print("\nReading data into memory-mapped files...")
-    var_info = [
-        ("tsta", TSTA_DIR, TSTA_PREFIX, 0),
-        ("gpp", GPP_DIR, GPP_PREFIX, 1),
-        ("vpd", VPD_DIR, "VPD", 2),
-        ("sm", SM_DIR, "SM", 3),
-        ("t2m", T2M_DIR, "T2M", 4),
-    ]
-    mmap_paths = {}
-
-    for vname, vdir, prefix, fidx in var_info:
-        mmap_tag = f"{TSTA_WINDOW.lower()}_gpp"
-        fp_mmap = os.path.join(TEMP_DIR, f"pathway_{mmap_tag}_{vname}.mmap")
-        mmap_paths[vname] = fp_mmap
-
-        if os.path.exists(fp_mmap):
-            fsize = os.path.getsize(fp_mmap)
-            expected = T * H * W * 4
-            if fsize == expected:
-                print(f"  {vname.upper()}: memmap exists, skip reading")
-                continue
-            else:
-                print(f"  {vname.upper()}: memmap size mismatch, re-reading")
-                os.remove(fp_mmap)
-
-        print(f"  Reading {vname.upper()}...")
-        stack = np.memmap(fp_mmap, dtype="float32", mode="w+", shape=shape)
-        for t, files in enumerate(tqdm(time_list, desc=f"    {vname}")):
-            try:
-                stack[t] = read_tif(files[fidx])
-            except Exception as e:
-                print(f"    Warning: {files[fidx]} -> {e}")
-                stack[t] = np.nan
-        stack.flush()
-        del stack
-        gc.collect()
-
-    # Parallel decomposition (each worker maps only the row it needs).
-    print("\nParallel pathway decomposition...")
-    results = Parallel(n_jobs=NUM_JOBS, backend="loky")(
-        delayed(_row_worker)(
-            row,
-            mmap_paths["tsta"], mmap_paths["gpp"],
-            mmap_paths["vpd"], mmap_paths["sm"],
-            mmap_paths["t2m"],
-            shape, MIN_SAMPLES, VIF_THRESHOLD
-        )
-        for row in tqdm(range(H), desc="Computing pathway decomposition")
+    prepare_output(OUTPUT_DIR)
+    draws = np.random.default_rng(BOOTSTRAP_SEED).multinomial(
+        len(YEARS), np.full(len(YEARS), 1 / len(YEARS)), size=BOOTSTRAP_REPEATS
     )
+    summary = {}
+    for name, settings in DATASETS.items():
+        response = load_series(settings["response"], settings["scale"])
+        pixels = np.flatnonzero(np.isfinite(response).any(axis=0))
+        values = np.empty((len(response), len(pixels), 5), dtype=np.float32)
+        values[:, :, 1] = response[:, pixels]
+        del response
+        for column, variable in enumerate(VARIABLES):
+            if variable != "response":
+                values[:, :, column] = load_series(settings[variable], settings["scale"])[:, pixels]
+        periods = 46 if settings["scale"] == "8day" else 12
+        statistics = annual_statistics(values, periods)
+        paired_statistics = annual_statistics(values, periods, paired_only=True)
+        total = statistics.sum(axis=0)
+        estimates = fit_pathways(total, paired_statistics.sum(axis=0))
+        lower = np.full_like(estimates, np.nan)
+        upper = lower.copy()
+        probability = lower.copy()
+        valid_fraction = lower.copy()
+        for start in range(0, len(pixels), PIXELS_PER_BATCH):
+            end = min(start + PIXELS_PER_BATCH, len(pixels))
+            batch_size = end - start
+            sampled = (draws @ statistics[:, start:end].reshape(len(YEARS), -1)).reshape(
+                BOOTSTRAP_REPEATS, batch_size, 21
+            )
+            sampled_pairs = (draws @ paired_statistics[:, start:end].reshape(len(YEARS), -1)).reshape(
+                BOOTSTRAP_REPEATS, batch_size, 21
+            )
+            bootstrap = fit_pathways(sampled, sampled_pairs)
+            with warnings.catch_warnings():
+                warnings.filterwarnings("ignore", message="All-NaN slice encountered")
+                lower[start:end], upper[start:end] = np.nanquantile(bootstrap, [0.025, 0.975], axis=0)
+            valid = np.isfinite(bootstrap)
+            extreme = (abs(bootstrap - estimates[None, start:end]) >= abs(estimates[None, start:end])) & valid
+            probability[start:end] = (1 + extreme.sum(axis=0)) / (1 + valid.sum(axis=0))
+            valid_fraction[start:end] = valid.mean(axis=0)
+            if start % 1024 == 0:
+                print(
+                    f"{name}: {end}/{len(pixels)} pixels, {BOOTSTRAP_REPEATS} year resamples each", flush=True
+                )
+        probability[~np.isfinite(estimates) | (valid_fraction == 0)] = np.nan
+        directory = OUTPUT_DIR / name
+        for column, metric in enumerate(METRICS):
+            for suffix, array in [
+                ("estimate", estimates),
+                ("ci_low", lower),
+                ("ci_high", upper),
+                ("p_bootstrap", probability),
+                ("valid_fraction", valid_fraction),
+            ]:
+                save_pixel_map(directory, f"{metric}_{suffix}", array[:, column], pixels)
+        count = total[:, 0]
+        with np.errstate(divide="ignore", invalid="ignore"):
+            matched = (total[:, 7] - total[:, 1] * total[:, 2] / count) / (
+                total[:, 6] - total[:, 1] ** 2 / count
+            )
+        save_pixel_map(directory, "S_direct_matched", matched, pixels)
+        save_pixel_map(directory, "S_residual", matched - estimates[:, 10], pixels)
+        save_pixel_map(directory, "n_complete", count, pixels)
+        save_pixel_map(directory, "n_pairs", paired_statistics[:, :, 0].sum(axis=0), pixels)
 
-    print("\nAssembling results...")
-    keys = ['a1', 'a2', 'a3', 'b1', 'b2', 'b3',
-            'cv', 'cs', 'ct', 'dom', 'c_dom',
-            'rv', 'rs', 'rt', 'r2', 'vif', 'valid']
-    maps = {k: np.full((H, W), np.nan, dtype=np.float32) for k in keys}
-
-    for (row, a1, a2, a3, b1, b2, b3, cv, cs, ct,
-         dom, c_dom, rv, rs, rt, r2, vif, valid) in results:
-        maps['a1'][row] = a1;    maps['a2'][row] = a2
-        maps['a3'][row] = a3;    maps['b1'][row] = b1
-        maps['b2'][row] = b2;    maps['b3'][row] = b3
-        maps['cv'][row] = cv;    maps['cs'][row] = cs
-        maps['ct'][row] = ct;    maps['dom'][row] = dom
-        maps['c_dom'][row] = c_dom; maps['rv'][row] = rv
-        maps['rs'][row] = rs;    maps['rt'][row] = rt
-        maps['r2'][row] = r2;    maps['vif'][row] = vif
-        maps['valid'][row] = valid
-
-    del results
-    gc.collect()
-
-    print("\nSaving results...")
-    save_tif(maps['a1'], "alpha1_TSTA_to_VPD.tif", profile)
-    save_tif(maps['a2'], "alpha2_TSTA_to_SM.tif", profile)
-    save_tif(maps['a3'], "alpha3_TSTA_to_T2M.tif", profile)
-    save_tif(maps['b1'], "beta1_VPD_to_GPP.tif", profile)
-    save_tif(maps['b2'], "beta2_SM_to_GPP.tif", profile)
-    save_tif(maps['b3'], "beta3_T2M_to_GPP.tif", profile)
-    save_tif(maps['cv'], "C_VPD_pathway.tif", profile)
-    save_tif(maps['cs'], "C_SM_pathway.tif", profile)
-    save_tif(maps['ct'], "C_T2M_pathway.tif", profile)
-    save_tif(maps['dom'], "Dominant_pathway_code.tif", profile)
-    save_tif(maps['c_dom'], "C_dominant_signed.tif", profile)
-    save_tif(maps['rv'], "RelContrib_VPD.tif", profile)
-    save_tif(maps['rs'], "RelContrib_SM.tif", profile)
-    save_tif(maps['rt'], "RelContrib_T2M.tif", profile)
-    save_tif(maps['r2'], "R_squared.tif", profile)
-    save_tif(maps['vif'], "VIF_max.tif", profile)
-    save_tif(maps['valid'], "VIF_valid_flag.tif", profile)
-
-    print("\n" + "=" * 60)
-    print("Result summary")
-    print("=" * 60)
-    valid_mask = maps['valid'] == 1
-    total_valid = np.isfinite(maps['valid']).sum()
-    print(f"Passed VIF check: {valid_mask.sum():,} pixels "
-          f"({valid_mask.sum() / total_valid * 100:.1f}%)")
-
-    for name, key in [("C_VPD", 'cv'), ("C_SM", 'cs'), ("C_T2M", 'ct')]:
-        v = maps[key][valid_mask & np.isfinite(maps[key])]
-        print(f"\n{name}: mean={v.mean():.4f}  median={np.median(v):.4f}  "
-              f"pos={(v > 0).mean() * 100:.1f}%  neg={(v < 0).mean() * 100:.1f}%")
-
-    dom = maps['dom'][valid_mask & np.isfinite(maps['dom'])]
-    c_d = maps['c_dom'][valid_mask & np.isfinite(maps['c_dom'])]
-    print("\nDominant pathway:")
-    for i, name in enumerate(["VPD", "SM", "T2M"]):
-        m = dom == i + 1
-        cd = c_d[m]
-        print(f"  {name}: {m.sum():,} pixels ({m.mean() * 100:.1f}%)  "
-              f"pos={(cd > 0).mean() * 100:.1f}%  neg={(cd < 0).mean() * 100:.1f}%")
-
-    r2v = maps['r2'][valid_mask & np.isfinite(maps['r2'])]
-    print(f"\nR^2: mean={r2v.mean():.3f}  median={np.median(r2v):.3f}")
-    print(f"\nOutput dir: {OUT_DIR}")
-    print("=" * 60)
-
-    # Memmap files are kept for restartability; uncomment to clean up.
-    # for p in mmap_paths.values():
-    #     if os.path.exists(p):
-    #         os.remove(p)
+        # Use HAC for regression coefficients and the year bootstrap for pathway contributions.
+        hac_probability = np.full((len(pixels), 7), np.nan)
+        lags = 6 if settings["scale"] == "8day" else 2
+        for index in range(len(pixels)):
+            if not np.isfinite(estimates[index]).all():
+                continue
+            pixel = values[:, index].astype(float)
+            complete = np.isfinite(pixel).all(axis=1)
+            matched_pixel = np.where(complete[:, None], pixel, np.nan)
+            for environmental in range(3):
+                fitted = fit_regression(matched_pixel[:, :1], matched_pixel[:, environmental + 2], lags, 5)
+                hac_probability[index, environmental] = fitted[2][1]
+            fitted = fit_regression(matched_pixel[:, 2:], matched_pixel[:, 1], lags, 5)
+            hac_probability[index, 3:6] = fitted[2][1:]
+            fitted = fit_regression(pixel[:, :1], pixel[:, 1], lags, 5)
+            hac_probability[index, 6] = fitted[2][1]
+        for column, metric in enumerate(METRICS[:6] + ["S_direct"]):
+            save_pixel_map(directory, f"{metric}_p_HAC", hac_probability[:, column], pixels)
+        summary[name] = {
+            "candidate_pixels": len(pixels),
+            "fitted_pixels": int(np.isfinite(estimates).all(axis=1).sum()),
+            "time_steps": len(values),
+            "bootstrap_repeats": BOOTSTRAP_REPEATS,
+            "bootstrap_seed": BOOTSTRAP_SEED,
+            "HAC_lags": lags,
+        }
+        print(f"{name}: complete", flush=True)
+    (OUTPUT_DIR / "run_summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
 
 
 if __name__ == "__main__":
