@@ -1,102 +1,91 @@
-"""Detrend and standardize 1-degree raster time series within each DOY or month."""
+"""Remove linear trends and standardize each DOY/month across years."""
 
 from pathlib import Path
 import json
-import re
 import numpy as np
 import rasterio
 from rasterio.transform import from_origin
 
-CODE_DIR = Path(__file__).resolve().parent
-YEARS = list(range(2001, 2024))
-GRID_SHAPE = (180, 360)
-GRID_TRANSFORM = from_origin(-180, 90, 1, 1)
-OVERWRITE = False
 
-OUTPUT_DIR = CODE_DIR / "outputs/01_standardized"
-MASK_FILE = CODE_DIR / "inputs/vegetation_mask_1deg.tif"
-RAW_ROOT = Path("D:/DATA")
+def detrend_series(years, observations, variable):
+    """Remove the linear trend from one pixel at one DOY or calendar month."""
+    valid = np.isfinite(observations)
+    valid_years = years[valid]
+    valid_values = observations[valid]
+    n = len(valid_values)
 
-DATASETS = {
-    "GOSIF_GPP_8day": {
-        "directory": RAW_ROOT / "GOSIF_GPP_8day_1deg",
-        "pattern": r"GOSIF_GPP_(?P<year>20\d{2})(?P<period>\d{3})_Mean_1deg\.tif$",
-        "scale": "8day",
-        "min_trend": 5,
-        "min_zscore": 3,
-        "sd_floor": 1e-6,
-        "sd_inclusive": True,
-        "fallback": "retain",
-        "residual_float32": False,
-        "center_years": False,
-        "minimum": 0,
-    },
-    "TSS_8day": {
-        "directory": RAW_ROOT / "TSS/TSS/8day/ERA5_LST__ERA5_TA",
-        "pattern": r"_(?P<year>20\d{2})_(?P<period>\d{3})_1deg_K\.tif$",
-        "scale": "8day",
-        "min_trend": 2,
-        "min_zscore": 2,
-        "sd_floor": 0,
-        "sd_inclusive": False,
-        "fallback": "missing",
-        "residual_float32": False,
-        "center_years": True,
-        "minimum": None,
-    },
-    "VPD_8day": {
-        "directory": RAW_ROOT / "FDI_8DAY_1DEG/VPD",
-        "pattern": r"_(?P<year>20\d{2})_(?P<period>\d{3})_8day_1deg\.tif$",
-        "scale": "8day",
-        "min_trend": 5,
-        "min_zscore": 3,
-        "sd_floor": 1e-6,
-        "sd_inclusive": True,
-        "fallback": "retain",
-        "residual_float32": True,
-        "center_years": False,
-        "minimum": None,
-    },
-    "SM_8day": {
-        "directory": RAW_ROOT / "FDI_8DAY_1DEG/SM",
-        "pattern": r"_(?P<year>20\d{2})_(?P<period>\d{3})_8day_1deg\.tif$",
-        "scale": "8day",
-        "min_trend": 5,
-        "min_zscore": 3,
-        "sd_floor": 1e-6,
-        "sd_inclusive": True,
-        "fallback": "retain",
-        "residual_float32": True,
-        "center_years": False,
-        "minimum": None,
-    },
-    "Ta_8day": {
-        "directory": RAW_ROOT / "FDI_8DAY_1DEG/TA_ALLDAY",
-        "pattern": r"_(?P<year>20\d{2})_(?P<period>\d{3})_8day_1deg\.tif$",
-        "scale": "8day",
-        "min_trend": 5,
-        "min_zscore": 3,
-        "sd_floor": 1e-6,
-        "sd_inclusive": True,
-        "fallback": "retain",
-        "residual_float32": True,
-        "center_years": False,
-        "minimum": None,
-    },
-    "TSS_monthly": {
-        "directory": RAW_ROOT / "TSS/TSS/monthly/ERA5_LST__ERA5_TA",
-        "pattern": r"_(?P<year>20\d{2})_(?P<period>\d{2})_1deg_K\.tif$",
-        "scale": "monthly",
-        "min_trend": 2,
-        "min_zscore": 2,
-        "sd_floor": 0,
-        "sd_inclusive": False,
-        "fallback": "missing",
-        "residual_float32": False,
-        "center_years": True,
-        "minimum": None,
-    },
-}
+    if variable == "TSS":
+        valid_years = valid_years - years.mean()
+        minimum_samples = 2
+    else:
+        minimum_samples = 5
+
+    if n < minimum_samples:
+        if variable == "TSS":
+            return np.full(len(years), np.nan)
+        return observations.copy()
+
+    sum_year = sum(valid_years)
+    sum_value = sum(valid_values)
+    denominator = n * sum(valid_years**2) - sum_year**2
+    if denominator <= 1e-12:
+        if variable == "TSS":
+            return np.full(len(years), np.nan)
+        return observations.copy()
+
+    slope = (n * sum(valid_years * valid_values) - sum_year * sum_value) / denominator
+    intercept = (sum_value - slope * sum_year) / n
+    trend = intercept + slope * valid_years
+    detrended = np.full(len(years), np.nan)
+    detrended[valid] = valid_values - trend
+    return detrended
+
+
+def standardize_series(detrended, variable):
+    """Subtract the period mean and divide by its sample standard deviation."""
+    if variable in ["VPD", "SM", "Ta"]:
+        # Environmental residuals are stored with single precision.
+        detrended = detrended.astype(np.float32)
+        detrended = detrended.astype(np.float64)
+
+    valid = np.isfinite(detrended)
+    standardized = np.full(len(detrended), np.nan)
+    if variable == "TSS":
+        minimum_samples = 2
+    else:
+        minimum_samples = 3
+    if valid.sum() < minimum_samples:
+        return standardized
+
+    period_mean = np.nanmean(detrended)
+    period_sd = np.nanstd(detrended, ddof=1)
+    if variable == "TSS":
+        if period_sd <= 0:
+            return standardized
+    else:
+        if period_sd < 1e-6:
+            return standardized
+    standardized[valid] = (detrended[valid] - period_mean) / period_sd
+    return standardized
+
+
+def standardize_period(values, dataset_name):
+    """Apply the same calculation to every pixel of a complete raster stack."""
+    if dataset_name.startswith("TSS"):
+        variable = "TSS"
+    elif dataset_name.startswith("GOSIF_GPP"):
+        variable = "GPP"
+    else:
+        variable = dataset_name.split("_")[0]
+
+    years = np.asarray(YEARS, dtype=float)
+    standardized = np.full(values.shape, np.nan, dtype=np.float32)
+    rows, columns = np.where(np.isfinite(values).any(axis=0))
+    for row, column in zip(rows, columns):
+        observations = values[:, row, column].astype(np.float64)
+        detrended = detrend_series(years, observations, variable)
+        standardized[:, row, column] = standardize_series(detrended, variable)
+    return standardized
 
 
 def read_raster(path):
@@ -105,7 +94,7 @@ def read_raster(path):
             source.shape != GRID_SHAPE
             or source.count != 1
             or source.crs != rasterio.crs.CRS.from_epsg(4326)
-            or not np.allclose(tuple(source.transform), tuple(GRID_TRANSFORM), rtol=0, atol=1e-9)
+            or not np.allclose(source.transform, GRID_TRANSFORM, rtol=0, atol=1e-9)
         ):
             raise ValueError(f"Expected an aligned global 1-degree EPSG:4326 raster: {path}")
         values = source.read(1, masked=True).astype("float64").filled(np.nan)
@@ -140,91 +129,147 @@ def prepare_output(directory):
     directory.mkdir(parents=True, exist_ok=True)
 
 
-def index_rasters(directory, pattern, time_scale):
-    periods = list(range(1, 366, 8)) if time_scale == "8day" else list(range(1, 13))
-    expected = [(year, period) for year in YEARS for period in periods]
+def index_rasters(directory, filename_type, time_scale):
+    if time_scale not in ["8day", "monthly"]:
+        raise ValueError("Time scale must be '8day' or 'monthly'")
+    if filename_type not in ["gosif_raw", "tss_raw", "environment_raw", "dated_raster"]:
+        raise ValueError(f"Unknown filename convention: {filename_type}")
+    if filename_type in ["gosif_raw", "environment_raw"] and time_scale != "8day":
+        raise ValueError(f"{filename_type} filenames require the 8day time scale")
+    if time_scale == "8day":
+        periods = list(range(1, 366, 8))
+    else:
+        periods = list(range(1, 13))
+
     paths = {}
     for path in sorted(directory.rglob("*.tif")):
-        match = re.search(pattern, path.name)
-        if match is None:
+        parts = path.stem.split("_")
+        if filename_type == "gosif_raw":
+            # GOSIF_GPP_2001001_Mean_1deg.tif
+            if not path.name.startswith("GOSIF_GPP_") or not path.name.endswith("_Mean_1deg.tif"):
+                continue
+            date_text = parts[2]
+            if len(date_text) != 7 or not date_text.isdigit():
+                continue
+            year_text = date_text[:4]
+            period_text = date_text[4:]
+        elif filename_type == "tss_raw":
+            # ERA5_LST__ERA5_TA_2001_001_1deg_K.tif
+            if len(parts) < 5 or parts[-2:] != ["1deg", "K"]:
+                continue
+            year_text = parts[-4]
+            period_text = parts[-3]
+        elif filename_type == "environment_raw":
+            # VPD_2001_001_8day_1deg.tif
+            if len(parts) < 5 or parts[-2:] != ["8day", "1deg"]:
+                continue
+            year_text = parts[-4]
+            period_text = parts[-3]
+        else:
+            # GOSIF_GPP_8day_z_2001_001_1deg.tif
+            if len(parts) < 4 or parts[-1] != "1deg":
+                continue
+            year_text = parts[-3]
+            period_text = parts[-2]
+
+        if not year_text.isdigit() or not period_text.isdigit():
             continue
-        year, period = int(match["year"]), int(match["period"])
+        year = int(year_text)
+        period = int(period_text)
         if year not in YEARS:
             continue
-        if period not in periods or (year, period) in paths:
+        date = (year, period)
+        if period not in periods or date in paths:
             raise ValueError(f"Invalid or duplicate date: {path}")
-        paths[year, period] = path
-    missing = sorted(set(expected) - set(paths))
-    if missing:
-        raise ValueError(f"Missing {len(missing)} raster dates in {directory}: {missing[:5]}")
-    return {key: paths[key] for key in expected}
+        paths[date] = path
+
+    ordered_paths = {}
+    for year in YEARS:
+        for period in periods:
+            date = (year, period)
+            if date not in paths:
+                raise ValueError(f"Missing raster for {year}, period {period}: {directory}")
+            ordered_paths[date] = paths[date]
+    return ordered_paths
 
 
-def standardize_period(values, settings):
-    values = values.astype(np.float64)
-    year = np.asarray(YEARS, dtype=float)
-    if settings["center_years"]:
-        year = year - year.mean()
-    year = year[:, None, None]
-    valid = np.isfinite(values)
-    count = valid.sum(axis=0)
-    sum_year = np.where(valid, year, 0).sum(axis=0)
-    sum_value = np.where(valid, values, 0).sum(axis=0)
-    sum_year_squared = np.where(valid, year * year, 0).sum(axis=0)
-    sum_year_value = np.where(valid, year * values, 0).sum(axis=0)
-    denominator = count * sum_year_squared - sum_year * sum_year
-    can_fit = (count >= settings["min_trend"]) & (denominator > 1e-12)
-    slope = np.zeros(GRID_SHAPE)
-    slope[can_fit] = (count * sum_year_value - sum_year * sum_value)[can_fit] / denominator[can_fit]
-    intercept = np.divide(
-        sum_value - slope * sum_year, count, out=np.full(GRID_SHAPE, np.nan), where=count > 0
-    )
-    residual = values - (intercept + slope * year)
-    if settings["fallback"] == "retain":
-        residual[:, ~can_fit] = values[:, ~can_fit]
+def process_dataset(dataset_name, input_directory, filename_type, time_scale, vegetation_mask):
+    paths = index_rasters(input_directory, filename_type, time_scale)
+    if time_scale == "8day":
+        periods = range(1, 366, 8)
     else:
-        residual[:, ~can_fit] = np.nan
-    if settings["residual_float32"]:
-        residual = residual.astype(np.float32).astype(np.float64)
+        periods = range(1, 13)
 
-    count = np.isfinite(residual).sum(axis=0)
-    enough = count >= settings["min_zscore"]
-    mean = np.full(GRID_SHAPE, np.nan)
-    sd = mean.copy()
-    mean[enough] = np.nanmean(residual[:, enough], axis=0)
-    sd[enough] = np.nanstd(residual[:, enough], axis=0, ddof=1)
-    if settings["sd_inclusive"]:
-        usable = enough & (sd >= settings["sd_floor"])
-    else:
-        usable = enough & (sd > settings["sd_floor"])
-    standardized = np.full_like(values, np.nan)
-    standardized[:, usable] = (residual[:, usable] - mean[usable]) / sd[usable]
-    return standardized.astype(np.float32)
+    valid_observations = 0
+    for period in periods:
+        yearly_rasters = []
+        for year in YEARS:
+            yearly_rasters.append(read_raster(paths[year, period]))
+        values = np.stack(yearly_rasters)
+        values[:, ~vegetation_mask] = np.nan
+        values[(values == 65534) | (values == 65535)] = np.nan
+        if dataset_name == "GOSIF_GPP_8day":
+            values[values < 0] = np.nan
+
+        standardized = standardize_period(values, dataset_name)
+        valid_observations += int(np.isfinite(standardized).sum())
+        for index, year in enumerate(YEARS):
+            if time_scale == "8day":
+                date = f"{year}_{period:03d}"
+            else:
+                date = f"{year}_{period:02d}"
+            run_name = f"{dataset_name}_{YEARS[0]}-{YEARS[-1]}"
+            filename = f"{run_name}_z_{date}_1deg.tif"
+            output_file = OUTPUT_DIR / run_name / str(year) / filename
+            write_raster(output_file, standardized[index], f"{dataset_name} standardized anomaly")
+        print(f"{dataset_name}: period {period:03d}, all {len(YEARS)} years complete", flush=True)
+
+    return {"rasters": len(paths), "valid_observations": valid_observations}
 
 
 def main():
-    prepare_output(OUTPUT_DIR)
-    retained = read_raster(MASK_FILE) == 1
-    report = {}
-    for name, settings in DATASETS.items():
-        paths = index_rasters(settings["directory"], settings["pattern"], settings["scale"])
-        periods = sorted({period for year, period in paths})
-        valid_observations = 0
-        for period in periods:
-            values = np.stack([read_raster(paths[year, period]) for year in YEARS])
-            values[:, ~retained] = np.nan
-            values[(values == 65534) | (values == 65535)] = np.nan
-            if settings["minimum"] is not None:
-                values[values < settings["minimum"]] = np.nan
-            standardized = standardize_period(values, settings)
-            valid_observations += int(np.isfinite(standardized).sum())
-            for index, year in enumerate(YEARS):
-                path = OUTPUT_DIR / name / str(year) / f"{name}_z_{year}_{period:03d}_1deg.tif"
-                write_raster(path, standardized[index], f"{name} standardized anomaly")
-            print(f"{name}: period {period:03d}, all {len(YEARS)} years complete", flush=True)
-        report[name] = {"rasters": len(paths), "valid_observations": valid_observations, "settings": settings}
-    (OUTPUT_DIR / "run_summary.json").write_text(json.dumps(report, indent=2, default=str), encoding="utf-8")
+    if len(YEARS) < 2:
+        raise ValueError("Select at least two years for detrending")
+    available = [dataset[0] for dataset in DATASETS]
+    if not RUN_DATASETS or len(RUN_DATASETS) != len(set(RUN_DATASETS)):
+        raise ValueError("RUN_DATASETS must contain unique dataset names")
+    for name in RUN_DATASETS:
+        if name not in available:
+            raise ValueError(f"Unknown dataset: {name}. Available: {available}")
+        prepare_output(OUTPUT_DIR / f"{name}_{YEARS[0]}-{YEARS[-1]}")
+    vegetation_mask = read_raster(MASK_FILE) == 1
+    for dataset_name, input_directory, filename_type, time_scale in DATASETS:
+        if dataset_name not in RUN_DATASETS:
+            continue
+        result = process_dataset(
+            dataset_name, input_directory, filename_type, time_scale, vegetation_mask
+        )
+        summary_file = OUTPUT_DIR / f"{dataset_name}_{YEARS[0]}-{YEARS[-1]}" / "run_summary.json"
+        summary_file.write_text(json.dumps({dataset_name: result}, indent=2), encoding="utf-8")
 
+
+# Input paths and run settings
+RUN_DATASETS = ["GOSIF_GPP_8day", "TSS_8day", "VPD_8day", "SM_8day", "Ta_8day", "TSS_monthly"]
+START_YEAR = 2001
+END_YEAR = 2023
+YEARS = list(range(START_YEAR, END_YEAR + 1))
+CODE_DIR = Path(__file__).resolve().parent
+RAW_ROOT = Path("D:/DATA")
+MASK_FILE = CODE_DIR / "inputs/vegetation_mask_1deg.tif"
+OUTPUT_DIR = CODE_DIR / "outputs/01_standardized"
+GRID_SHAPE = (180, 360)
+GRID_TRANSFORM = from_origin(-180, 90, 1, 1)
+OVERWRITE = False
+
+# Dataset name, input directory, filename convention, time step
+DATASETS = [
+    ("GOSIF_GPP_8day", RAW_ROOT / "GOSIF_GPP_8day_1deg", "gosif_raw", "8day"),
+    ("TSS_8day", RAW_ROOT / "TSS/TSS/8day/ERA5_LST__ERA5_TA", "tss_raw", "8day"),
+    ("VPD_8day", RAW_ROOT / "FDI_8DAY_1DEG/VPD", "environment_raw", "8day"),
+    ("SM_8day", RAW_ROOT / "FDI_8DAY_1DEG/SM", "environment_raw", "8day"),
+    ("Ta_8day", RAW_ROOT / "FDI_8DAY_1DEG/TA_ALLDAY", "environment_raw", "8day"),
+    ("TSS_monthly", RAW_ROOT / "TSS/TSS/monthly/ERA5_LST__ERA5_TA", "tss_raw", "monthly"),
+]
 
 if __name__ == "__main__":
     main()

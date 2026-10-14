@@ -4,8 +4,7 @@ title: "Analysis code"
 authors:
   - family-names: Wang
     given-names: Wenhao
-version: v2.0.0
 doi: 10.5281/zenodo.21276954
-date-released: 2026-10-12
+date-released: 2026-10-14
 url: "https://github.com/1117wwh/tsta-gpp-code"
 license: MIT

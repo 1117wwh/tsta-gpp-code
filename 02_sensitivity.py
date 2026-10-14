@@ -1,43 +1,58 @@
-"""Calculate pixelwise sensitivity and HAC uncertainty from standardized rasters."""
+"""Regress productivity on TSS at each pixel and estimate HAC uncertainty."""
 
 from pathlib import Path
 import json
-import re
 import numpy as np
 import rasterio
 from rasterio.transform import from_origin
 from scipy.stats import t as student_t
 
-CODE_DIR = Path(__file__).resolve().parent
-YEARS = list(range(2001, 2024))
-GRID_SHAPE = (180, 360)
-GRID_TRANSFORM = from_origin(-180, 90, 1, 1)
-OVERWRITE = False
+def fit_regression(predictors, response, lags, minimum_samples):
+    """Fit OLS with an intercept and calculate HAC uncertainty."""
+    valid = np.isfinite(response) & np.isfinite(predictors).all(axis=1)
+    sample_count = int(valid.sum())
+    design_matrix = np.column_stack([np.ones(len(response)), predictors])
+    valid_predictors = design_matrix[valid]
+    observed = response[valid]
+    coefficient_count = design_matrix.shape[1]
+    if sample_count < max(minimum_samples, coefficient_count + 1):
+        return None
+    if np.linalg.matrix_rank(valid_predictors) < coefficient_count:
+        return None
 
-STANDARDIZED_DIR = CODE_DIR / "outputs/01_standardized"
-MONTHLY_DIR = Path("D:/DATA/TTS-GPP/STANDARDIZED/1deg_monthly")
-DATASETS = {
-    "GOSIF_GPP_8day": {
-        "scale": "8day",
-        "TSS": STANDARDIZED_DIR / "TSS_8day",
-        "response": STANDARDIZED_DIR / "GOSIF_GPP_8day",
-        "VPD": STANDARDIZED_DIR / "VPD_8day",
-        "SM": STANDARDIZED_DIR / "SM_8day",
-        "Ta": STANDARDIZED_DIR / "Ta_8day",
-    },
-    "GloFlux_GPP_monthly": {
-        "scale": "monthly",
-        "TSS": STANDARDIZED_DIR / "TSS_monthly",
-        "response": MONTHLY_DIR / "GLOFLUX_GPP_MONTH_ZSCORE",
-        "VPD": MONTHLY_DIR / "ERA5Land_VPD_MONTH_ZSCORE",
-        "SM": MONTHLY_DIR / "ERA5Land_SM_MONTH_ZSCORE",
-        "Ta": MONTHLY_DIR / "ERA5Land_TA_ALLDAY_MONTH_ZSCORE",
-    },
-}
+    coefficients = np.linalg.lstsq(valid_predictors, observed, rcond=None)[0]
+    fitted_values = np.dot(valid_predictors, coefficients)
+    residuals = observed - fitted_values
+    predictor_products = np.dot(valid_predictors.T, valid_predictors)
+    inverse_products = np.linalg.inv(predictor_products)
 
-OUTPUT_DIR = CODE_DIR / "outputs/02_sensitivity"
-MINIMUM_SAMPLES = 30
+    # Missing dates keep their positions so HAC lags follow the original time axis.
+    weighted_residuals = np.zeros_like(design_matrix)
+    residual_column = residuals.reshape(sample_count, 1)
+    weighted_residuals[valid] = valid_predictors * residual_column
+    residual_covariance = np.dot(weighted_residuals.T, weighted_residuals)
+    for lag in range(1, min(lags, len(response) - 1) + 1):
+        later_values = weighted_residuals[lag:]
+        earlier_values = weighted_residuals[:-lag]
+        lagged_covariance = np.dot(later_values.T, earlier_values)
+        bartlett_weight = 1 - lag / (lags + 1)
+        residual_covariance += bartlett_weight * (lagged_covariance + lagged_covariance.T)
 
+    coefficient_covariance = np.dot(inverse_products, residual_covariance)
+    coefficient_covariance = np.dot(coefficient_covariance, inverse_products)
+    coefficient_covariance = coefficient_covariance * sample_count / (sample_count - coefficient_count)
+    standard_errors = np.sqrt(np.maximum(np.diag(coefficient_covariance), 0))
+    degrees_of_freedom = sample_count - coefficient_count
+    with np.errstate(divide="ignore", invalid="ignore"):
+        t_statistics = coefficients / standard_errors
+        p_values = 2 * student_t.sf(abs(t_statistics), degrees_of_freedom)
+
+    total_variation = np.sum((observed - observed.mean()) ** 2)
+    if total_variation > 0:
+        r_squared = 1 - np.sum(residuals**2) / total_variation
+    else:
+        r_squared = np.nan
+    return coefficients, standard_errors, p_values, sample_count, r_squared
 
 def read_raster(path):
     with rasterio.open(path) as source:
@@ -45,7 +60,7 @@ def read_raster(path):
             source.shape != GRID_SHAPE
             or source.count != 1
             or source.crs != rasterio.crs.CRS.from_epsg(4326)
-            or not np.allclose(tuple(source.transform), tuple(GRID_TRANSFORM), rtol=0, atol=1e-9)
+            or not np.allclose(source.transform, GRID_TRANSFORM, rtol=0, atol=1e-9)
         ):
             raise ValueError(f"Expected an aligned global 1-degree EPSG:4326 raster: {path}")
         values = source.read(1, masked=True).astype("float64").filled(np.nan)
@@ -79,86 +94,85 @@ def prepare_output(directory):
         raise FileExistsError(f"Results already exist. Change OUTPUT_DIR or set OVERWRITE=True: {directory}")
     directory.mkdir(parents=True, exist_ok=True)
 
+def index_rasters(directory, time_scale):
+    if time_scale not in ["8day", "monthly"]:
+        raise ValueError("Time scale must be '8day' or 'monthly'")
+    if time_scale == "8day":
+        periods = range(1, 366, 8)
+    else:
+        periods = range(1, 13)
 
-def index_rasters(directory, pattern, time_scale):
-    periods = list(range(1, 366, 8)) if time_scale == "8day" else list(range(1, 13))
-    expected = [(year, period) for year in YEARS for period in periods]
     paths = {}
     for path in sorted(directory.rglob("*.tif")):
-        match = re.search(pattern, path.name)
-        if match is None:
+        # Example: GOSIF_GPP_8day_z_2001_001_1deg.tif
+        parts = path.stem.split("_")
+        if len(parts) < 4 or parts[-1] != "1deg":
             continue
-        year, period = int(match["year"]), int(match["period"])
+        if not parts[-3].isdigit() or not parts[-2].isdigit():
+            continue
+        year = int(parts[-3])
+        period = int(parts[-2])
         if year not in YEARS:
             continue
-        if period not in periods or (year, period) in paths:
+        date = (year, period)
+        if period not in periods or date in paths:
             raise ValueError(f"Invalid or duplicate date: {path}")
-        paths[year, period] = path
-    missing = sorted(set(expected) - set(paths))
-    if missing:
-        raise ValueError(f"Missing {len(missing)} raster dates in {directory}: {missing[:5]}")
-    return {key: paths[key] for key in expected}
+        paths[date] = path
+
+    ordered_paths = {}
+    for year in YEARS:
+        for period in periods:
+            if (year, period) not in paths:
+                raise ValueError(f"Missing raster for {year}, period {period}: {directory}")
+            ordered_paths[year, period] = paths[year, period]
+    return ordered_paths
 
 
 def load_series(directory, time_scale):
-    paths = index_rasters(directory, r"_(?P<year>20\d{2})_(?P<period>\d{2,3})_1deg\.tif$", time_scale)
+    paths = index_rasters(directory, time_scale)
+    # Rows are dates; columns are pixels in north-to-south raster order.
     values = np.empty((len(paths), 180 * 360), dtype=np.float32)
     for index, path in enumerate(paths.values()):
-        values[index] = read_raster(path).ravel()
+        raster = read_raster(path)
+        values[index] = raster.flatten()
     print(f"Read {len(paths)} full rasters: {directory}", flush=True)
     return values
 
 
 def save_pixel_map(directory, name, values, pixels):
-    grid = np.full(GRID_SHAPE, np.nan, dtype=np.float64)
-    grid.ravel()[pixels] = values
-    write_raster(directory / f"{name}_1deg.tif", grid, name)
-
-
-def fit_regression(predictors, response, lags, minimum_samples):
-    valid = np.isfinite(response) & np.isfinite(predictors).all(axis=1)
-    count = int(valid.sum())
-    design = np.column_stack([np.ones(len(response)), predictors])
-    fitted_design = design[valid]
-    observed = response[valid]
-    parameters = design.shape[1]
-    if count < max(minimum_samples, parameters + 1) or np.linalg.matrix_rank(fitted_design) < parameters:
-        return None
-    coefficients = np.linalg.lstsq(fitted_design, observed, rcond=None)[0]
-    residual = observed - fitted_design @ coefficients
-    inverse_gram = np.linalg.inv(fitted_design.T @ fitted_design)
-    # Keep missing dates in the time axis when computing HAC lagged products.
-    scores = np.zeros_like(design)
-    scores[valid] = fitted_design * residual[:, None]
-    score_covariance = scores.T @ scores
-    for lag in range(1, min(lags, len(response) - 1) + 1):
-        cross_product = scores[lag:].T @ scores[:-lag]
-        weight = 1 - lag / (lags + 1)
-        score_covariance += weight * (cross_product + cross_product.T)
-    covariance = inverse_gram @ score_covariance @ inverse_gram * count / (count - parameters)
-    standard_error = np.sqrt(np.maximum(np.diag(covariance), 0))
-    with np.errstate(divide="ignore", invalid="ignore"):
-        p_value = 2 * student_t.sf(abs(coefficients / standard_error), count - parameters)
-    total_variation = np.sum((observed - observed.mean()) ** 2)
-    r_squared = 1 - np.sum(residual**2) / total_variation if total_variation > 0 else np.nan
-    return coefficients, standard_error, p_value, count, r_squared
-
+    flat_grid = np.full(180 * 360, np.nan, dtype=np.float64)
+    flat_grid[pixels] = values
+    grid = flat_grid.reshape(180, 360)
+    write_raster(directory / f"{directory.name}_{name}_1deg.tif", grid, name)
 
 def main():
-    prepare_output(OUTPUT_DIR)
-    summary = {}
-    for name, settings in DATASETS.items():
-        tss = load_series(settings["TSS"], settings["scale"])
-        response = load_series(settings["response"], settings["scale"])
-        pixels = np.flatnonzero(np.isfinite(response).any(axis=0))
-        maps = {
-            key: np.full(len(pixels), np.nan)
-            for key in ["sensitivity", "intercept", "standard_error_HAC", "p_HAC", "n_pairs", "r_squared"]
-        }
-        lags = 6 if settings["scale"] == "8day" else 2
+    if not YEARS:
+        raise ValueError("START_YEAR must not exceed END_YEAR")
+    if not RUN_DATASETS or len(RUN_DATASETS) != len(set(RUN_DATASETS)):
+        raise ValueError("RUN_DATASETS must contain unique dataset names")
+    for name in RUN_DATASETS:
+        if name not in DATASETS:
+            raise ValueError(f"Unknown dataset: {name}. Available: {list(DATASETS)}")
+        if DATASETS[name]["scale"] not in ["8day", "monthly"] or not name.endswith("_" + DATASETS[name]["scale"]):
+            raise ValueError(f"Dataset name and time scale disagree: {name}")
+        prepare_output(OUTPUT_DIR / f"{name}_{YEARS[0]}-{YEARS[-1]}")
+    for name in RUN_DATASETS:
+        dataset = DATASETS[name]
+        directory = OUTPUT_DIR / f"{name}_{YEARS[0]}-{YEARS[-1]}"
+        TSS = load_series(dataset["TSS"], dataset["scale"])
+        GPP = load_series(dataset["GPP"], dataset["scale"])
+        pixels = np.flatnonzero(np.isfinite(GPP).any(axis=0))
+        maps = {}
+        output_names = ["sensitivity", "intercept", "standard_error_HAC", "p_HAC", "n_pairs", "r_squared"]
+        for output_name in output_names:
+            maps[output_name] = np.full(len(pixels), np.nan)
+        if dataset["scale"] == "8day":
+            lags = 6
+        else:
+            lags = 2
         for index, pixel in enumerate(pixels):
-            maps["n_pairs"][index] = np.sum(np.isfinite(tss[:, pixel]) & np.isfinite(response[:, pixel]))
-            fitted = fit_regression(tss[:, pixel, None], response[:, pixel], lags, MINIMUM_SAMPLES)
+            maps["n_pairs"][index] = np.sum(np.isfinite(TSS[:, pixel]) & np.isfinite(GPP[:, pixel]))
+            fitted = fit_regression(TSS[:, pixel].reshape(-1, 1), GPP[:, pixel], lags, MINIMUM_SAMPLES)
             if fitted is None:
                 continue
             coefficients, standard_error, p_value, count, r_squared = fitted
@@ -168,17 +182,42 @@ def main():
             maps["p_HAC"][index] = p_value[1]
             maps["r_squared"][index] = r_squared
         for metric, values in maps.items():
-            save_pixel_map(OUTPUT_DIR / name, metric, values, pixels)
-        summary[name] = {
+            save_pixel_map(directory, metric, values, pixels)
+        result = {
             "candidate_pixels": len(pixels),
             "fitted_pixels": int(np.isfinite(maps["sensitivity"]).sum()),
-            "time_steps": len(tss),
+            "time_steps": len(TSS),
             "HAC_lags": lags,
             "minimum_samples": MINIMUM_SAMPLES,
         }
-        print(f"{name}: {summary[name]}", flush=True)
-    (OUTPUT_DIR / "run_summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
+        print(f"{name}: {result}", flush=True)
+        (directory / "run_summary.json").write_text(json.dumps({name: result}, indent=2), encoding="utf-8")
 
+# Input paths and run settings
+RUN_DATASETS = ["GOSIF_GPP_8day", "GloFlux_GPP_monthly"]
+START_YEAR = 2001
+END_YEAR = 2023
+YEARS = list(range(START_YEAR, END_YEAR + 1))
+CODE_DIR = Path(__file__).resolve().parent
+GRID_SHAPE = (180, 360)
+GRID_TRANSFORM = from_origin(-180, 90, 1, 1)
+OVERWRITE = False
+STANDARDIZED_DIR = CODE_DIR / "outputs/01_standardized"
+MONTHLY_DIR = Path("D:/DATA/TTS-GPP/STANDARDIZED/1deg_monthly")
+DATASETS = {
+    "GOSIF_GPP_8day": {
+        "scale": "8day",
+        "TSS": STANDARDIZED_DIR / f"TSS_8day_{START_YEAR}-{END_YEAR}",
+        "GPP": STANDARDIZED_DIR / f"GOSIF_GPP_8day_{START_YEAR}-{END_YEAR}",
+    },
+    "GloFlux_GPP_monthly": {
+        "scale": "monthly",
+        "TSS": STANDARDIZED_DIR / f"TSS_monthly_{START_YEAR}-{END_YEAR}",
+        "GPP": MONTHLY_DIR / "GLOFLUX_GPP_MONTH_ZSCORE",
+    },
+}
+OUTPUT_DIR = CODE_DIR / "outputs/02_sensitivity"
+MINIMUM_SAMPLES = 30
 
 if __name__ == "__main__":
     main()
