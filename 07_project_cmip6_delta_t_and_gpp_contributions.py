@@ -1,56 +1,33 @@
-"""Reproduce annual CMIP6 DeltaT sensitivities and GPP contributions (Fig. 5, S9, S14, S20–S23).
+"""Estimate GPP sensitivity to all-day annual CMIP6 ΔT and its contribution relative to 2001–2014."""
 
-Inputs are physical annual arrays in year x pixel x variable order:
-DeltaT, GPP, Ta, precipitation, radiation, CO2, VPD. They are prepared upstream
-with each model calendar: sum GPP over the year and day-weight the other fields.
-Annualized GPP is g C m-2 year-1. For each validation fold estimate trend and
-scale on training years. Use the accepted complete support common to both
-scenarios and both trend specifications. Report the detrended sensitivity.
-Convert its coefficient to physical GPP per degree before multiplying by
-the DeltaT anomaly. Normalize by historical GPP on the same spatial domain;
-calculate model endpoints first, then weight the twelve models equally.
-
-Inputs
-------
-The inputs directory contains prepared annual historical and scenario NPZ files. The
-selected path identifies the model selection JSON. Regional summaries and recent
-trends require the project spatial and ERA5 reference files.
-
-Run from the directory containing this script
---------------------------------------------
-    python 07_project_cmip6_delta_t_and_gpp_contributions.py
-
-Outputs in results/07
----------------------
-Per-model pixel tables, annual.csv, model_endpoints.csv, ensemble_endpoints.csv,
-regional.csv and recent_trends.csv.
-"""
-
+import json
 from pathlib import Path
-import argparse
 import numpy as np
 import pandas as pd
+import rasterio
+
+
+PATHS_FILE = Path(__file__).resolve().parent / "07_data_paths.txt"
 
 
 def solve_ridge(moment, predictors, response, penalty):
-    # Matrices store sums of cross products; column zero is the intercept.
-    """Fit ridge regression from cross-products and return the unpenalized intercept
-    followed by predictor slopes.
-    """
+    """Fit slopes from cross-products, leaving the intercept unpenalized."""
     count = moment[..., 0, 0]
     sums = moment[..., predictors, 0]
     gram = (
         moment[..., predictors, :][..., :, predictors]
         - sums[..., None] * sums[..., None, :] / count[..., None, None]
     )
-    rhs = moment[..., predictors, response] - sums * (moment[..., 0, response] / count)[..., None]
+    cross_covariance = (
+        moment[..., predictors, response] - sums * (moment[..., 0, response] / count)[..., None]
+    )
     system = gram + (count * penalty)[..., None, None] * np.eye(len(predictors))
     if np.isscalar(penalty) and penalty == 0:
         valid = np.linalg.matrix_rank(gram) == len(predictors)
-        slopes = np.full(rhs.shape, np.nan)
-        slopes[valid] = np.linalg.solve(system[valid], rhs[valid, ..., None])[..., 0]
+        slopes = np.full(cross_covariance.shape, np.nan)
+        slopes[valid] = np.linalg.solve(system[valid], cross_covariance[valid, ..., None])[..., 0]
     else:
-        slopes = np.linalg.solve(system, rhs[..., None])[..., 0]
+        slopes = np.linalg.solve(system, cross_covariance[..., None])[..., 0]
     intercept = (moment[..., 0, response] - (slopes * sums).sum(-1)) / count
     return np.concatenate([intercept[..., None], slopes], axis=-1)
 
@@ -151,9 +128,7 @@ def cross_products(z):
 
 
 def annual_fit(raw):
-    """Return the eligibility mask and standardized and physical DeltaT slopes after
-    year-block penalty selection.
-    """
+    """Choose the penalty by year-block validation, then convert the ΔT slope to g C m⁻² yr⁻¹ K⁻¹."""
     predictors = [1, 3, 4, 5, 6, 7]  # DeltaT, Ta, TP, SSRD, CO2, VPD
     years = np.arange(len(raw))
     grid = np.r_[0, np.logspace(-5, 2, 29)]
@@ -162,20 +137,20 @@ def annual_fit(raw):
     for fold in np.array_split(years, 5):
         train = np.setdiff1d(years, fold)
         z, _ = standardized(raw, train)
-        train_m, test_m = cross_products(z[train]), cross_products(z[fold])
-        good = (train_m[:, 0, 0] > 1) & (test_m[:, 0, 0] > 0)
+        training_moments, test_moments = cross_products(z[train]), cross_products(z[fold])
+        good = (training_moments[:, 0, 0] > 1) & (test_moments[:, 0, 0] > 0)
         eligible &= good
         columns = [0] + predictors
-        test = test_m[good]
+        test = test_moments[good]
         gram = test[:, columns, :][:, :, columns]
         for i, penalty in enumerate(grid):
-            coef = solve_ridge(train_m[good], predictors, 2, penalty)
-            sse = (
+            coef = solve_ridge(training_moments[good], predictors, 2, penalty)
+            squared_error = (
                 test[:, 2, 2]
                 - 2 * (coef * test[:, columns, 2]).sum(-1)
                 + np.einsum("pi,pij,pj->p", coef, gram, coef)
             )
-            score[i, good] += np.where(np.isfinite(sse), sse, np.inf)
+            score[i, good] += np.where(np.isfinite(squared_error), squared_error, np.inf)
     z, sd = standardized(raw, years)
     full = cross_products(z)
     eligible &= (full[:, 0, 0] >= 30) & np.isfinite(score).any(0)
@@ -185,140 +160,118 @@ def annual_fit(raw):
     return eligible, slopes, physical
 
 
-def calculate(model, scenario):
-    """Write model-scenario pixel sensitivities and return the annual area-weighted
-    series.
-    """
-    history = sorted(inputs.glob(model + "_historical_*.npz"))
-    if not history:
-        raise FileNotFoundError(model)
-    sums = np.zeros((100, 2))
-    total_weight = historical_gpp = pixels = 0
-    maps = []
-    for path in history:
-        datasets = []
-        for period in ["historical", "ssp245", "ssp585"]:
-            with np.load(path.with_name(path.name.replace("_historical_", f"_{period}_"))) as item:
-                flat = item["flat"]
-                datasets.append(item["raw"])
-        common = np.logical_and.reduce([np.isfinite(array).all(axis=(0, 2)) for array in datasets])
-        if not common.any():
-            continue
-        # The accepted maps and denominator require eligible fits in both scenarios
-        # under retained-trend and detrended preprocessing.
-        shared = np.ones(common.sum(), dtype=bool)
-        for future in datasets[1:]:
-            candidate = np.concatenate([datasets[0], future])[:, common, :]
-            for detrend in [False, True]:
-                shared &= fitted_domain(candidate, detrend)
-        common[common] = shared
-        if not common.any():
-            continue
-        raw = np.concatenate([datasets[0], datasets[1 if scenario == "ssp245" else 2]])[
-            :, common, :
-        ]
-        eligible, beta, physical = annual_fit(raw)
-        raw = raw[:, eligible]
-        flat = flat[common][eligible]
-        baseline = raw[:14].mean(0)
-        anomaly = raw[:, :, 0] - baseline[:, 0]
-        weight = np.cos(np.deg2rad(89.5 - flat // 360))
-        sums[:, 0] += anomaly @ weight
-        sums[:, 1] += (anomaly * physical) @ weight
-        historical_gpp += np.sum(weight * baseline[:, 1])
-        total_weight += weight.sum()
-        pixels += len(flat)
-        maps.append(
-            pd.DataFrame(
-                dict(
-                    flat=flat,
-                    sensitivity=beta,
-                    physical_slope=physical,
-                    delta_t_change=anomaly[-20:].mean(0),
-                )
-            )
-        )
-    pd.concat(maps).to_csv(output / f"{model}_{scenario}_pixels.csv", index=False)
-    return pd.DataFrame(
-        dict(
-            model=model,
-            scenario=scenario,
-            year=np.arange(2001, 2101),
-            pixels=pixels,
-            DeltaT=sums[:, 0] / total_weight,
-            annual_change=sums[:, 1] / total_weight,
-            baseline_GPP=historical_gpp / total_weight,
-            percent=100 * sums[:, 1] / historical_gpp,
-        )
-    )
+def area_totals(delta_t_anomaly, historical_gpp, physical_slope, pixels):
+    """Sum ΔT anomalies and their GPP contributions with cosine-latitude weights."""
+    weight = np.cos(np.deg2rad(89.5 - pixels // 360))
+    totals = np.empty((len(delta_t_anomaly), 4))
+    totals[:, 0] = delta_t_anomaly @ weight
+    totals[:, 1] = (delta_t_anomaly * physical_slope) @ weight
+    totals[:, 2] = weight @ historical_gpp
+    totals[:, 3] = weight.sum()
+    return totals
 
 
-def regional_tables(annual):
-    """Use each model's matched pixel support and the same regional GPP denominator."""
-    import rasterio
-
-    config = json.loads(
-        (folder.parent / "supplementary_materials/config/datasets.json").read_text(encoding="utf8")
-    )
-    with rasterio.open(config["datasets"]["main_figure1_ai"]["files"][0]) as image:
-        ai = image.read(1, masked=True).astype(float).filled(np.nan).ravel()
-    rows = []
-    for model, scenario in (
-        annual[["model", "scenario"]].drop_duplicates().itertuples(index=False, name=None)
-    ):
-        slopes = pd.read_csv(
-            output / f"{model}_{scenario}_pixels.csv", float_precision="round_trip"
-        ).set_index("flat")
-        sums = {key: np.zeros((100, 4)) for key in ["Water_limited", "Energy_limited"]}
-        for path in sorted(inputs.glob(model + "_historical_*.npz")):
-            with np.load(path) as record:
-                flat = record["flat"]
-                selected_pixels = np.isin(flat, slopes.index)
-                baseline = record["raw"][:, selected_pixels].mean(0)
-                historical_dt = record["raw"][:, selected_pixels, 0]
-            flat = flat[selected_pixels]
-            with np.load(
-                path.with_name(path.name.replace("_historical_", f"_{scenario}_"))
-            ) as future:
-                anomaly = (
-                    np.concatenate([historical_dt, future["raw"][:, selected_pixels, 0]])
-                    - baseline[:, 0]
-                )
-            beta = slopes.loc[flat, "physical_slope"].to_numpy()
-            for group, selected_cells in [
-                ("Water_limited", ai[flat] < 1),
-                ("Energy_limited", ai[flat] >= 1),
-            ]:
-                weight = np.cos(np.deg2rad(89.5 - flat[selected_cells] // 360))
-                change = anomaly[:, selected_cells]
-                sums[group][:, 0] += change @ weight
-                sums[group][:, 1] += (change * beta[selected_cells]) @ weight
-                sums[group][:, 2] += weight @ baseline[selected_cells, 1]
-                sums[group][:, 3] += weight.sum()
-        for group, values in sums.items():
-            rows.append(
-                pd.DataFrame(
-                    dict(
-                        model=model,
-                        scenario=scenario,
-                        group=group,
-                        year=np.arange(2001, 2101),
-                        DeltaT=values[:, 0] / values[:, 3],
-                        percent=100 * values[:, 1] / values[:, 2],
-                        baseline_GPP=values[:, 2] / values[:, 3],
+def model_projections(model, inputs, aridity, output):
+    """Use the same eligible cells in the historical period and both scenarios."""
+    scenarios = ["ssp245", "ssp585"]
+    groups = ["Global", "Water_limited", "Energy_limited"]
+    totals = {(scenario, group): np.zeros((100, 4)) for scenario in scenarios for group in groups}
+    pixel_tables = {scenario: [] for scenario in scenarios}
+    for path in sorted(inputs.glob(model + "_historical_*.npz")):
+        with np.load(path) as historical:
+            flat = historical["flat"]
+            history = historical["raw"]
+        # Raw columns: ΔT, GPP, Ta, TP, SSRD, CO2 and VPD. Rows are calendar years.
+        series = {}
+        for scenario in scenarios:
+            future_path = path.with_name(path.name.replace("_historical_", f"_{scenario}_"))
+            with np.load(future_path) as future:
+                if not np.array_equal(flat, future["flat"]):
+                    raise ValueError(f"Different historical and scenario grids in {future_path}")
+                if history.shape != (14, len(flat), 7) or future["raw"].shape != (86, len(flat), 7):
+                    raise ValueError(
+                        f"Expected 14 historical and 86 scenario years in {future_path}"
                     )
+                series[scenario] = np.concatenate([history, future["raw"]])
+        complete = np.isfinite(series["ssp245"]).all(axis=(0, 2)) & np.isfinite(
+            series["ssp585"]
+        ).all(axis=(0, 2))
+        if not complete.any():
+            continue
+        # Membership is common to both scenarios and to fits with and without detrending.
+        shared = np.ones(complete.sum(), dtype=bool)
+        for data in series.values():
+            for detrend in (False, True):
+                shared &= fitted_domain(data[:, complete], detrend)
+        pixels = flat[complete][shared]
+        if len(pixels) == 0:
+            continue
+        for scenario, data in series.items():
+            raw = data[:, complete][:, shared]
+            eligible, standardized_slope, physical_slope = annual_fit(raw)
+            raw = raw[:, eligible]
+            fitted_pixels = pixels[eligible]
+            baseline = raw[:14].mean(axis=0)
+            delta_t_anomaly = raw[:, :, 0] - baseline[:, 0]
+            pixel_tables[scenario].append(
+                pd.DataFrame(
+                    {
+                        "flat": fitted_pixels,
+                        "S_std": standardized_slope,
+                        "S_phys_gC_m2_yr_K": physical_slope,
+                        "DeltaT_anomaly_2081_2100_vs_2001_2014_C": delta_t_anomaly[-20:].mean(
+                            axis=0
+                        ),
+                    }
                 )
             )
-    pd.concat(rows).to_csv(output / "regional.csv", index=False)
+            totals[scenario, "Global"] += area_totals(
+                delta_t_anomaly, baseline[:, 1], physical_slope, fitted_pixels
+            )
+            for group, mask in [
+                ("Water_limited", aridity[fitted_pixels] < 1),
+                ("Energy_limited", aridity[fitted_pixels] >= 1),
+            ]:
+                totals[scenario, group] += area_totals(
+                    delta_t_anomaly[:, mask],
+                    baseline[mask, 1],
+                    physical_slope[mask],
+                    fitted_pixels[mask],
+                )
+
+    global_series, regional_series = [], []
+    for scenario in scenarios:
+        pixel_table = pd.concat(pixel_tables[scenario], ignore_index=True)
+        pixel_table.to_csv(output / f"{model}_{scenario}_pixels.csv", index=False)
+        for group in groups:
+            temperature_sum, contribution_sum, gpp_sum, area = totals[scenario, group].T
+            series = pd.DataFrame(
+                {
+                    "model": model,
+                    "scenario": scenario,
+                    "year": np.arange(2001, 2101),
+                    "DeltaT_anomaly_2001_2014_C": temperature_sum / area,
+                    "GPP_baseline_2001_2014_gC_m2_yr": gpp_sum / area,
+                    "GPP_contribution_pct": 100 * contribution_sum / gpp_sum,
+                }
+            )
+            if group == "Global":
+                series.insert(3, "pixels", len(pixel_table))
+                series.insert(5, "GPP_contribution_gC_m2_yr", contribution_sum / area)
+                global_series.append(series)
+            else:
+                series.insert(2, "group", group)
+                regional_series.append(series)
+    return pd.concat(global_series), pd.concat(regional_series)
 
 
-def recent_trends(annual):
-    """Fit the three S14 windows to the original fixed-baseline annual anomalies."""
-    era_file = selected.parent / "ERA5_reference_original.csv"
-    era5 = pd.read_csv(era_file).groupby("year").DeltaT.mean()
+def recent_trends(annual, era_file, output):
+    """Fit decadal ΔT anomaly trends in the three ERA5–CMIP6 comparison windows."""
+    # ERA5 stores the 2001–2014 anomaly under the original column heading DeltaT.
+    era5 = pd.read_csv(era_file).groupby("year")["DeltaT"].mean()
     rows = []
     for scenario, members in annual.groupby("scenario"):
-        cmip = members.groupby("year").DeltaT.mean()
+        cmip = members.groupby("year")["DeltaT_anomaly_2001_2014_C"].mean()
         for start, end in [(2001, 2014), (2015, 2023), (2001, 2023)]:
             for source, data in [("ERA5", era5), ("CMIP6", cmip)]:
                 period = data.loc[start:end]
@@ -336,26 +289,40 @@ def recent_trends(annual):
 
 
 if __name__ == "__main__":
-    import json
+    paths = json.loads(PATHS_FILE.read_text(encoding="utf-8-sig"))
+    CMIP6_ANNUAL_INPUT_DIR = PATHS_FILE.parent / paths["CMIP6_ANNUAL_INPUT_DIR"]
+    ARIDITY_INDEX_PATH = PATHS_FILE.parent / paths["ARIDITY_INDEX_PATH"]
+    ERA5_REFERENCE_PATH = PATHS_FILE.parent / paths["ERA5_REFERENCE_PATH"]
+    OUTPUT_DIR = PATHS_FILE.parent / paths["OUTPUT_DIR"]
 
-    folder = Path(__file__).resolve().parent
-    inputs = Path(
-        "D:/DATA/DeltaT_GPP_Analysis/Results/Temporary/cmip6_overall_review_20261030/figure5_recalculation/annual_inputs"
+    models = [
+        "ACCESS-ESM1-5",
+        "CMCC-ESM2",
+        "CanESM5",
+        "INM-CM5-0",
+        "IPSL-CM6A-LR",
+        "UKESM1-0-LL",
+        "CESM2",
+        "CNRM-ESM2-1",
+        "EC-Earth3-Veg",
+        "CNRM-CM6-1-HR",
+        "INM-CM4-8",
+        "CMCC-CM2-SR5",
+    ]
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    with rasterio.open(ARIDITY_INDEX_PATH) as raster:
+        aridity = raster.read(1, masked=True).astype(float).filled(np.nan).ravel()
+    global_series, regional_series = [], []
+    for model in models:
+        annual_global, annual_regional = model_projections(model, CMIP6_ANNUAL_INPUT_DIR, aridity, OUTPUT_DIR)
+        global_series.append(annual_global)
+        regional_series.append(annual_regional)
+    annual = pd.concat(global_series, ignore_index=True)
+    annual.to_csv(OUTPUT_DIR / "annual.csv", index=False)
+    pd.concat(regional_series).to_csv(OUTPUT_DIR / "regional.csv", index=False)
+    endpoints = (
+        annual[annual.year >= 2081].groupby(["scenario", "model"])["GPP_contribution_pct"].mean()
     )
-    selected = (
-        folder.parent
-        / "Figure5_release_20261102_12models/Code/frozen_inputs/analysis/selection.json"
-    )
-    output = folder / "results/07"
-    output.mkdir(exist_ok=True, parents=True)
-    tables = []
-    for model in json.loads(selected.read_text())["models"]:
-        for scenario in ["ssp245", "ssp585"]:
-            tables.append(calculate(model, scenario))
-    annual = pd.concat(tables, ignore_index=True)
-    annual.to_csv(output / "annual.csv", index=False)
-    late = annual[annual.year >= 2081].groupby(["scenario", "model"]).percent.mean()
-    late.to_csv(output / "model_endpoints.csv")
-    late.groupby("scenario").mean().to_csv(output / "ensemble_endpoints.csv")
-    regional_tables(annual)
-    recent_trends(annual)
+    endpoints.to_csv(OUTPUT_DIR / "model_endpoints.csv")
+    endpoints.groupby("scenario").mean().to_csv(OUTPUT_DIR / "ensemble_endpoints.csv")
+    recent_trends(annual, ERA5_REFERENCE_PATH, OUTPUT_DIR)

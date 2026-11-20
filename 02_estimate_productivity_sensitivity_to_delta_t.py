@@ -1,304 +1,180 @@
-"""Estimate standardized productivity sensitivity to daytime DeltaT (Fig. 1 and S1).
+"""Estimate ΔT sensitivity from standardized gridded products and FLUXNET site records."""
 
-Use each product's native time scale: 8-day GOSIF GPP/SIF and monthly GloFlux/LHSIF.
-Five contiguous calendar-year folds select the ridge penalty. A fixed-penalty
-1999-draw year bootstrap gives a two-sided centered P value at each pixel.
-The default input is archived annual cross-products. Use --from-rasters to start
-from standardized input rasters and optionally --temperature-root results/01.
-Use --stations results/05 for the separate FLUXNET GPP and canopy-conductance analyses.
-The flat pixel index is row * 360 + column on the 180 by 360 north-up grid.
+# Gridded NOAA background CO₂ is already aligned to each 8-day period or calendar month:
+# its 41 sine-latitude nodes have been interpolated to 180 rows and repeated across 360 longitudes.
+# FLUXNET regressions use each site's own CO₂ series (CO2_F_MDS).
 
-Inputs
-------
-The default grid fit uses archived yearly matrices and the vegetation pixel index.
-For prepared rasters, first run script 01 both with and without --other-inputs. For
-station fits, run script 05 for all sites.
-
-Run from the directory containing this script
---------------------------------------------
-    python 02_estimate_productivity_sensitivity_to_delta_t.py
-    python 02_estimate_productivity_sensitivity_to_delta_t.py --from-rasters --prepared-root results/01
-    python 02_estimate_productivity_sensitivity_to_delta_t.py --stations results/05
-
-Outputs in results/02
----------------------
-One CSV per productivity product, or stations.csv for the station fit. In grid mode
---point-only skips bootstrap P values.
-"""
-
+import json
 from pathlib import Path
-import argparse
+
 import numpy as np
 import pandas as pd
+import rasterio
 
 
-def solve_ridge(moment, predictors, response, penalty):
-    # Matrices store sums of cross products; column zero is the intercept.
-    """Fit ridge regression from cross-products and return the unpenalized intercept
-    followed by predictor slopes.
-    """
-    count = moment[..., 0, 0]
-    sums = moment[..., predictors, 0]
-    gram = (
-        moment[..., predictors, :][..., :, predictors]
-        - sums[..., None] * sums[..., None, :] / count[..., None, None]
-    )
-    rhs = moment[..., predictors, response] - sums * (moment[..., 0, response] / count)[..., None]
-    system = gram + (count * penalty)[..., None, None] * np.eye(len(predictors))
-    if np.isscalar(penalty) and penalty == 0:
-        valid = np.linalg.matrix_rank(gram) == len(predictors)
-        slopes = np.full(rhs.shape, np.nan)
-        slopes[valid] = np.linalg.solve(system[valid], rhs[valid, ..., None])[..., 0]
-    else:
-        slopes = np.linalg.solve(system, rhs[..., None])[..., 0]
-    intercept = (moment[..., 0, response] - (slopes * sums).sum(-1)) / count
-    return np.concatenate([intercept[..., None], slopes], axis=-1)
+PATHS_FILE = Path(__file__).resolve().parent / "02_data_paths.txt"
+PREDICTORS = ["DeltaT", "Ta", "TP", "SSRD", "CO2", "VPD"]
+PENALTIES = np.r_[0.0, np.logspace(-5, 2, 29)]
+N_BOOTSTRAP = 2000
 
 
-def choose_penalty(annual, predictors, response):
-    """Select each pixel's penalty by minimizing prediction error across five contiguous
-    year folds.
-    """
-    total = annual.sum(0)
-    grid = np.r_[0, np.logspace(-5, 2, 29)]
-    scores = np.zeros((len(grid), len(total)))
-    columns = [0] + predictors
-    for fold in np.array_split(np.arange(len(annual)), 5):
-        test = annual[fold].sum(0)
-        for i, penalty in enumerate(grid):
-            coef = solve_ridge(total - test, predictors, response, penalty)
-            cross = test[:, columns, response]
-            gram = test[:, columns, :][:, :, columns]
-            residual_ss = (
-                test[:, response, response]
-                - 2 * (coef * cross).sum(-1)
-                + np.einsum("pi,pij,pj->p", coef, gram, coef)
-            )
-            scores[i] += np.where(np.isfinite(residual_ss), residual_ss, np.inf)
-    return grid[scores.argmin(axis=0)]
+def year_cross_products(values):
+    """Sum cross-products over complete dates. Input axes are date, cell, variable."""
+    complete = np.isfinite(values).all(axis=-1)
+    # Columns are the intercept, the six predictors, and the response.
+    design = np.concatenate([np.ones_like(values[..., :1]), values], axis=-1)
+    design[~complete] = 0
+    return np.einsum("tpi,tpj->pij", design, design)
 
 
-def calculate_block(annual, flat, bootstrap=True):
-    """Return pixel estimates, sample counts and penalties, with year-bootstrap P values
-    when requested.
-    """
-    total = annual.sum(0)
-    penalties = [choose_penalty(annual, inputs, target) for _, inputs, target in equations]
-    estimates = calculate_metrics(total, penalties)
-    table = pd.DataFrame(estimates, columns=metrics)
-    table.insert(0, "flat", flat)
-    table["n"] = total[:, 0, 0].astype(int)
-    for (name, _, _), penalty in zip(equations, penalties):
-        table[name] = penalty
-    if bootstrap:
-        count = len(annual)
-        draws = np.random.default_rng(20261021).multinomial(
-            count, np.full(count, 1 / count), size=1999
-        )
-        probabilities = np.empty_like(estimates)
-        for start in range(0, len(flat), 12):
-            block = annual[:, start : start + 12]
-            bootstrap_sum = (draws @ block.reshape(count, -1)).reshape(1999, *block.shape[1:])
-            samples = calculate_metrics(bootstrap_sum, [v[start : start + 12] for v in penalties])
-            observed = estimates[start : start + 12]
-            extreme = np.abs(samples - observed) >= np.abs(observed)
-            probabilities[start : start + 12] = (1 + extreme.sum(axis=0)) / 2000
-        for i, name in enumerate(metrics):
-            table["p_" + name] = probabilities[:, i]
-    return table
+def fit_ridge(products, penalty):
+    """Fit an intercept and six slopes by minimizing mean squared error plus the ridge penalty."""
+    xtx = products[..., :-1, :-1]
+    xty = products[..., :-1, -1]
+    count = products[..., 0, 0]
+    ridge_weights = np.diag([0.0] + [1.0] * len(PREDICTORS))  # The intercept is unpenalized.
+    system = xtx + (count * penalty)[..., None, None] * ridge_weights
+
+    valid = (count > 0) & np.isfinite(penalty)
+    unpenalized = valid & (penalty == 0)
+    if unpenalized.any():
+        valid[unpenalized] = np.linalg.matrix_rank(xtx[unpenalized]) == xtx.shape[-1]
+    coefficients = np.full(xty.shape, np.nan)
+    coefficients[valid] = np.linalg.solve(system[valid], xty[valid][..., None])[..., 0]
+    return coefficients
 
 
-def calculate_metrics(total, penalties):
-    """Extract the standardized DeltaT coefficient from the productivity regression for
-    each pixel.
-    """
-    name, predictors, response = equations[0]
-    slopes = solve_ridge(total, predictors, response, penalties[0])
-    return slopes[..., 1:2]
+def choose_penalty(annual):
+    """Select a separate ridge penalty for each cell or site using five blocks of years."""
+    total = annual.sum(axis=0)
+    scores = np.zeros((len(PENALTIES), len(total)))
+    for held_out in np.array_split(np.arange(len(annual)), 5):
+        test = annual[held_out].sum(axis=0)
+        train = total - test
+        for i, penalty in enumerate(PENALTIES):
+            coefficients = fit_ridge(train, penalty)
+            # The test residual is y minus the intercept and fitted predictor terms.
+            weights = np.column_stack([-coefficients, np.ones(len(test))])
+            squared_error = np.einsum("pi,pij,pj->p", weights, test, weights)
+            scores[i] += np.where(np.isfinite(squared_error), squared_error, np.inf)
+    best = PENALTIES[scores.argmin(axis=0)]
+    best[~np.isfinite(scores).any(axis=0)] = np.nan
+    return best
 
 
-def from_rasters(
-    index_path, variables, pixels, periods, scale, temperature_root=None, prepared_root=None
-):
-    """Build annual cross products on the joint finite sample for this equation set."""
-    import rasterio
+def bootstrap_p_value(annual, penalty, sensitivity):
+    """Resample entire years, hold the penalty fixed, and calculate a two-sided P value."""
+    n_years, n_cells = annual.shape[:2]
+    rng = np.random.default_rng(20261021)
+    draws = rng.multinomial(n_years, np.full(n_years, 1 / n_years), size=N_BOOTSTRAP)
+    p_value = np.full(n_cells, np.nan)
+    for start in range(0, n_cells, 12):  # Process a few cells at a time to limit memory use.
+        cells = slice(start, start + 12)
+        block = annual[:, cells]
+        resampled = np.einsum("by,ypij->bpij", draws, block, optimize=True)
+        slopes = fit_ridge(resampled, penalty[cells])[..., 1]
+        observed = sensitivity[cells]
+        extreme = np.abs(slopes - observed) >= np.abs(observed)
+        p = (1 + extreme.sum(axis=0)) / (N_BOOTSTRAP + 1)
+        p[~np.isfinite(observed) | ~np.isfinite(slopes).all(axis=0)] = np.nan
+        p_value[cells] = p
+    return p_value
 
-    inventory = pd.read_csv(index_path)
-    if "scale" in inventory:
-        inventory = inventory.loc[inventory.scale.eq(scale)]
-    inventory = inventory[inventory.variable.isin(variables)]
-    files = inventory.pivot(
-        index=["year", "period"], columns="variable", values="path"
-    ).sort_index()
-    expected = pd.MultiIndex.from_product([range(2001, 2024), periods], names=["year", "period"])
-    files = files.reindex(index=expected, columns=variables)
-    if files.isna().any().any():
-        raise ValueError("Missing year, period, or variable in the input index")
-    width = len(variables) + 1
-    moments = np.zeros((23, len(pixels), width, width))
-    for index, (_, group) in enumerate(files.groupby(level="year")):
-        values = np.ones((len(group), len(pixels), width))
-        for t, paths in enumerate(group.itertuples(index=False, name=None)):
-            for j, path in enumerate(paths):
-                path = Path(path)
-                if temperature_root and variables[j] in ["Ta", "DeltaT"]:
-                    tail = path.parts[path.parts.index("standardized") + 1 :]
-                    path = temperature_root.joinpath(scale, *tail)
-                if prepared_root and variables[j] not in ["H", "LE"]:
-                    tail = path.parts[path.parts.index("standardized") + 1 :]
-                    path = prepared_root.joinpath(scale, *tail)
+
+def read_grid_years(raster_dir, product, scale, pixels):
+    """Read prepared anomalies and collect one cross-product matrix per year and cell."""
+    fields = PREDICTORS + [product]
+    periods = range(1, 362, 8) if scale == "8day" else range(1, 13)
+    annual = []
+    for year in range(2001, 2024):
+        values = np.empty((len(periods), len(pixels), len(fields)))
+        for t, period in enumerate(periods):
+            interval = f"DOY{period:03d}" if scale == "8day" else f"M{period:02d}"
+            for j, variable in enumerate(fields):
+                path = raster_dir / scale / variable / f"{variable}_{year}_{interval}_zscore.tif"
                 with rasterio.open(path) as raster:
                     if (
                         raster.shape != (180, 360)
+                        or raster.crs is None
                         or raster.crs.to_epsg() != 4326
                         or tuple(raster.transform)[:6] != (1, 0, -180, 0, -1, 90)
                     ):
-                        raise ValueError(f"Unexpected grid: {path}")
-                    values[t, :, j + 1] = (
-                        raster.read(1, masked=True).astype(float).filled(np.nan).ravel()[pixels]
-                    )
-        valid = np.isfinite(values).all(axis=-1)
-        values[~valid] = 0
-        moments[index] = np.einsum("tpi,tpj->pij", values, values)
-    per_year = moments[:, :, 0, 0]
-    total = per_year.sum(0)
-    keep = total >= 30
-    for fold in np.array_split(np.arange(23), 5):
-        keep &= total - per_year[fold].sum(0) > 1
-    for start in range(0, len(pixels), 512):
-        select = np.flatnonzero(keep[start : start + 512]) + start
-        if len(select):
-            yield moments[:, select], pixels[select]
+                        raise ValueError(f"Expected the study's 1° grid in {path}")
+                    values[t, :, j] = raster.read(1, masked=True).filled(np.nan).ravel()[pixels]
+        annual.append(year_cross_products(values))
+    return np.stack(annual)
 
 
-def process_product(source, pattern, index, variables, pixels, periods, scale, args):
-    """Read or rebuild annual cross-products for one product and combine the resulting
-    pixel estimates into a table.
-    """
-    tables = []
-    if args.from_rasters:
-        blocks = from_rasters(
-            index, variables, pixels, periods, scale, args.temperature_root, args.prepared_root
-        )
-        for annual, flat in blocks:
-            tables.append(calculate_block(annual, flat, not args.point_only))
-    else:
-        for path in sorted(source.glob(pattern)):
-            support = path.with_name(path.name.replace("moments", "support")).with_suffix(".npz")
-            with np.load(support) as data:
-                tables.append(calculate_block(np.load(path), data["flat"], not args.point_only))
-    return pd.concat(tables, ignore_index=True)
+def grid_sensitivities(annual, pixels):
+    counts = annual[:, :, 0, 0]
+    total_count = counts.sum(axis=0)
+    eligible = total_count >= 30
+    for held_out in np.array_split(np.arange(len(annual)), 5):
+        eligible &= total_count - counts[held_out].sum(axis=0) > 1
+
+    annual = annual[:, eligible]
+    penalty = choose_penalty(annual)
+    coefficients = fit_ridge(annual.sum(axis=0), penalty)
+    sensitivity = coefficients[:, 1]  # ΔT is the first predictor.
+    return pd.DataFrame({
+        "flat": pixels[eligible],
+        "S_std": sensitivity,
+        "n": total_count[eligible].astype(int),
+        "lambda_ridge": penalty,
+        "p_S_std": bootstrap_p_value(annual, penalty, sensitivity),
+        "intercept": coefficients[:, 0],
+    })
 
 
-def station_sensitivities(gc_folder):
-    """Use response-specific day sets for FLUXNET GPP and active-day conductance."""
-    sites = pd.read_csv(
-        folder.parent
-        / "Figure_releases_20261029/Figure_01/20261029_154sites/station_analysis/station_GPP_Gc_AI.csv"
-    ).site
+def station_sensitivities(sites, response_dirs):
+    """Fit daily GPP and Gc separately using the valid dates for each response."""
     rows = []
-    predictors = ["DeltaT_z", "Ta_z", "TP_z", "SSRD_z", "CO2_z", "VPD_z"]
     for site in sites:
-        path = (
-            folder.parent
-            / f"Figure2_preparation_20261028/20261028_shared_processed_batch/stations/{site}.csv"
-        )
-        days = pd.read_csv(path, float_precision="round_trip")
-        daily = pd.read_csv(gc_folder / f"{site}.csv", float_precision="round_trip").set_index(
-            "date"
-        )
-        conductance = days.date.map(daily.gc_m_s)
-        trend = conductance.copy()
-        for _, group in days.loc[conductance.notna()].groupby("doy"):
-            y = conductance.loc[group.index].to_numpy()
-            x = group.year.to_numpy(dtype=float)
-            if len(y) >= 5 and np.var(x) > 1e-12:
-                x -= x.mean()
-                centered = y - y.mean()
-                trend.loc[group.index] = centered - x * np.dot(x, centered) / np.dot(x, x)
-        month_day = pd.to_datetime(days.date).dt.strftime("%m-%d")
-        seasonal = trend.groupby(month_day)
-        sd = seasonal.transform("std")
-        days["Gc_z"] = ((trend - seasonal.transform("mean")) / sd).where(
-            (sd >= 1e-6) & (seasonal.transform("count") >= 3)
-        )
-        for response in ["GPP", "Gc"]:
-            cols = [predictors[0], response + "_z"] + predictors[1:]
-            valid = days.loc[np.isfinite(days[cols]).all(axis=1)]
-            matrices = []
-            for _, group in valid.groupby("year"):
-                design = np.column_stack([np.ones(len(group)), group[cols].to_numpy()])
-                matrices.append(design.T @ design)
-            if len(valid) < 30 or len(matrices) < 2:
-                continue
-            annual = np.stack(matrices)[:, None]
-            inputs = equations[0][1]
-            penalty = choose_penalty(annual, inputs, 2)
-            beta = solve_ridge(annual.sum(0), inputs, 2, penalty)[0, 1]
-            rows.append(
-                dict(
-                    site=site,
-                    response=response,
-                    n=len(valid),
-                    years=len(matrices),
-                    sensitivity=beta,
-                    lambda_ridge=penalty[0],
-                )
+        for response, directory in response_dirs.items():
+            fields = [name + "_z" for name in PREDICTORS + [response]]
+            days = pd.read_csv(
+                directory / f"{site}.csv", usecols=["year"] + fields, float_precision="round_trip"
             )
-    pd.DataFrame(rows).to_csv(output / "stations.csv", index=False)
+            days = days.loc[np.isfinite(days[fields]).all(axis=1)]
+            if len(days) < 30 or days.year.nunique() < 2:
+                continue
+            yearly = []
+            for _, group in days.groupby("year"):
+                yearly.append(year_cross_products(group[fields].to_numpy()[:, None, :]))
+            annual = np.stack(yearly)
+            penalty = choose_penalty(annual)
+            coefficients = fit_ridge(annual.sum(axis=0), penalty)[0]
+            rows.append({
+                "site": site,
+                "response": response,
+                "n": len(days),
+                "years": len(annual),
+                "coefficient": "S_std" if response == "GPP" else "Gc_sensitivity_to_DeltaT_std",
+                "estimate": coefficients[1],
+                "lambda_ridge": penalty[0],
+                "intercept": coefficients[0],
+            })
+    return pd.DataFrame(rows)
 
 
 if __name__ == "__main__":
-    equations = [("lambda_ridge", [1, 3, 4, 5, 6, 7], 2)]
-    metrics = ["sensitivity"]
-    folder = Path(__file__).resolve().parent
-    archive = (
-        Path("D:/DATA/DeltaT_GPP_Analysis/Results/Temporary")
-        / "20261024_F01_daytime_VPD_ridge_native"
-    )
-    output = folder / "results/02"
-    output.mkdir(parents=True, exist_ok=True)
-    parser = argparse.ArgumentParser()
-    parser.add_argument(
-        "--from-rasters",
-        action="store_true",
-        help="Build yearly matrices from standardized rasters instead of reading their archived cross-products",
-    )
-    parser.add_argument(
-        "--temperature-root",
-        type=Path,
-        help="Optional output directory of script 01 for raster input",
-    )
-    parser.add_argument("--point-only", action="store_true")
-    parser.add_argument(
-        "--stations",
-        type=Path,
-        help="Run station models from the folder of daily Gc files instead of the raster models",
-    )
-    parser.add_argument(
-        "--prepared-root",
-        type=Path,
-        help="Use script 01 outputs for all productivity and control inputs; H and LE use the inventory",
-    )
-    args = parser.parse_args()
-    if args.temperature_root and args.prepared_root:
-        parser.error("Choose either temperature-only or all prepared inputs")
-    if args.stations:
-        station_sensitivities(args.stations)
-        raise SystemExit(0)
-    pixels = np.load(folder.parent / "main_figures/monthly_tp_ssrd_20260917/source_data/flat.npy")
-    products = [
-        ("GOSIF_GPP", "8day"),
-        ("GOSIF_SIF", "8day"),
-        ("GLOFLUX_GPP", "monthly"),
-        ("LHSIF_SIF", "monthly"),
-    ]
-    for product, scale in products:
-        periods = range(1, 362, 8) if scale == "8day" else range(1, 13)
-        variables = ["DeltaT", product, "Ta", "TP", "SSRD", "CO2", "VPD"]
-        source = archive / "rows" / scale
-        index = archive / "input_index.csv"
-        pattern = product + "_*_moments.npy"
-        result = process_product(source, pattern, index, variables, pixels, periods, scale, args)
-        filename = product + ("_point.csv" if args.point_only else ".csv")
-        result.to_csv(output / filename, index=False)
+    paths = json.loads(PATHS_FILE.read_text(encoding="utf-8-sig"))
+    VEG_MASK_PATH = PATHS_FILE.parent / paths["VEG_MASK_PATH"]
+    STANDARDIZED_RASTER_DIR = PATHS_FILE.parent / paths["STANDARDIZED_RASTER_DIR"]
+    STATION_COHORT_PATH = PATHS_FILE.parent / paths["STATION_COHORT_PATH"]
+    STATION_GPP_DIR = PATHS_FILE.parent / paths["STATION_GPP_DIR"]
+    STATION_GC_DIR = PATHS_FILE.parent / paths["STATION_GC_DIR"]
+    OUTPUT_DIR = PATHS_FILE.parent / paths["OUTPUT_DIR"]
+
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    pixels = np.load(VEG_MASK_PATH)  # Flat indices of vegetated 1° grid cells.
+
+    products = {"8day": ["GOSIF_GPP", "GOSIF_SIF"], "monthly": ["GLOFLUX_GPP", "LHSIF_SIF"]}
+    for scale, names in products.items():
+        for product in names:
+            annual = read_grid_years(STANDARDIZED_RASTER_DIR, product, scale, pixels)
+            grid_sensitivities(annual, pixels).to_csv(OUTPUT_DIR / f"{product}.csv", index=False)
+
+    sites = pd.read_csv(STATION_COHORT_PATH, usecols=["site"]).site
+    response_dirs = {"GPP": STATION_GPP_DIR, "Gc": STATION_GC_DIR}
+    station_sensitivities(sites, response_dirs).to_csv(OUTPUT_DIR / "stations.csv", index=False)

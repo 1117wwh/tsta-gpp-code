@@ -1,135 +1,62 @@
-# Surface-air temperature difference and vegetation productivity
+# Surface–air temperature difference and vegetation productivity
 
-This release contains the seven Python scripts used to estimate vegetation productivity sensitivity to the daytime land surface minus air temperature difference (DeltaT), quantify sensible-heat and latent-heat contributions, and project changes in GPP under two CMIP6 scenarios.
+ΔT is land surface temperature minus near-surface air temperature. The observational regressions use daytime ΔT. The CMIP6 projections use annual, all-day ΔT.
 
-## Where to start
+## Running the analyses
 
-Run the commands below from the directory containing these scripts. Each script writes to its own numbered folder under `results/`. Runs can replace existing output files. The observational grid analyses use 2001-2023 data at 1 degree, with 8-day GOSIF GPP and SIF and monthly GloFlux GPP and LHSIF.
+Install the Python dependencies used for these analyses.
 
-- **Grid sensitivity and pathways.** Scripts 02 and 03 can start directly from archived annual cross-products. To rebuild from rasters, run both modes of 01 before using the prepared-input commands below. Script 03 fits H and LE on DeltaT and five controls, then fits GPP on both fluxes and the controls. Multiplying the corresponding slopes gives the H and LE contributions.
-- **FLUXNET.** Run 05 for all sites to produce the daily canopy conductance needed by the station mode of 02 or the daily-input mode of 06. Script 03 also has a station pathway analysis. Script 06 can run independently from the archived annual anomalies for the selected Figure 2 model.
-- **Spatial drivers and projections.** Script 04 reads the prepared grid-cell training table. Script 07 reads prepared annual CMIP6 fields, fits model-specific sensitivities and calculates the contribution of DeltaT to projected GPP relative to 2001-2014.
-
-## Software and data layout
-
-Use Python with NumPy and pandas. Raster processing requires rasterio, FLUXNET conductance requires PyArrow, and the machine-learning analysis uses scikit-learn, statsmodels and XGBoost 1.6.2. This is a code release. Source observations, prepared rasters, annual matrices, station records, model inputs and reference tables must be available separately.
-
-The scripts use the study archive layout. On another computer, update the project-relative and absolute data paths in the scripts and any paths recorded in the CSV or JSON input inventories. Keep time periods, spatial masks and variable order consistent with those inventories when reproducing the manuscript.
-
-## Run individual analyses
-
-### 01 Prepare Figure 1 daytime temperature inputs from unstandardized 1-degree rasters.
-
-The temperature stage and vegetation index are set by stage and mask_indices. Other
-products use the raster inventory in input_index. Requires rasterio.
-
-```bash
-python 01_detrend_and_standardize_inputs.py
-python 01_detrend_and_standardize_inputs.py --other-inputs
-python 01_detrend_and_standardize_inputs.py --check-only
+```sh
+python -m pip install numpy==2.1.3 pandas==2.2.3 rasterio==1.4.3 pyarrow==19.0.0 scikit-learn==1.6.1 scipy==1.15.3 statsmodels==0.14.4 xgboost==1.6.2
 ```
 
-**Output directory** `results/01/`
+For each script you plan to run, create a UTF-8 JSON file beside it named `NN_data_paths.txt`, where `NN` is the script number (01–07). Use the input keys shown in the script’s `if __name__ == "__main__":` block and set `OUTPUT_DIR` to your chosen results directory. Paths can be absolute or relative to the TXT file. For example, `04_data_paths.txt` can contain
 
-Standardized rasters and inventory CSVs. Use --verify to compare while writing, or
---check-only to compare without writing rasters. Add --other-inputs to check
-productivity and control fields.
-
-### 02 Estimate standardized productivity sensitivity to daytime DeltaT (Fig. 1 and S1).
-
-The default grid fit uses archived yearly matrices and the vegetation pixel index.
-For prepared rasters, first run script 01 both with and without --other-inputs. For
-station fits, run script 05 for all sites.
-
-```bash
-python 02_estimate_productivity_sensitivity_to_delta_t.py
-python 02_estimate_productivity_sensitivity_to_delta_t.py --from-rasters --prepared-root results/01
-python 02_estimate_productivity_sensitivity_to_delta_t.py --stations results/05
+```json
+{
+  "TRAINING_TABLE_PATH": "data/training_table.csv",
+  "OUTPUT_DIR": "results/04"
+}
 ```
 
-**Output directory** `results/02/`
+In 01, `RAW_8DAY_FILES` and `RAW_MONTHLY_FILES` map each raster variable to its filename pattern. Use `{year}` for the year and `{period:03d}` (8-day starting day) or `{period:02d}` (month) for the period. Both dictionaries use `DeltaT`, `Ta`, `TP`, `SSRD` and `VPD`. The 8-day dictionary also uses `GOSIF_GPP` and `GOSIF_SIF`. The monthly dictionary also uses `GLOFLUX_GPP` and `LHSIF_SIF`. Supply CO₂ separately through `CO2_SOURCE_PATH`.
 
-One CSV per productivity product, or stations.csv for the station fit. In grid mode
---point-only skips bootstrap P values.
+Run 01 and then 02 for the observational grid sensitivities. Set `OUTPUT_DIR` in 01 and `STANDARDIZED_RASTER_DIR` in 02 to the same folder, for example `results/01_standardized`. The FLUXNET part of 02 and scripts 03–07 read the prepared inputs specified in their own path files.
 
-### 03 Estimate sensible-heat and latent-heat pathways (Fig. 3 and S5–S8).
+| Script | What it reads and calculates | What it writes |
+|---|---|---|
+| 01 | Reads the 1° observations for 2001–2023 and the NOAA CO₂ latitude–time table. Screens the four productivity products for temporal outliers. Removes each cell’s linear trend across years separately for each 8-day period or month. Divides the centred residuals by their sample standard deviation and applies the vegetation mask. | A global 180 × 360 GeoTIFF per variable and period. |
+| 02 | Reads the rasters written by 01. Fits each productivity response on ΔT, air temperature, precipitation, solar radiation, CO₂ and vapour pressure deficit. Fits daily GPP and canopy conductance separately at each FLUXNET site from the corresponding prepared station tables. | Four grid tables and one station table, with the ΔT coefficient, sample size, intercept and selected ridge penalty. Grid tables also contain the whole-year bootstrap P value. |
+| 03 | Reads two paper inventories of standardized rasters, including sensible and latent heat flux, and the complete daily station anomaly tables. Fits the two flux responses to ΔT and the partial GPP responses to the fluxes on dates shared by all equations. | Grid and station tables of slopes, the two pathway products, their sum and the directly fitted sensitivity. |
+| 04 | Reads the prepared predictor table and the mean of the four **monthly** product sensitivities. Fits three XGBoost models with 4, 8 and 12 predictors using the original training/test split. | Predictions, held-out scores, bootstrap scores, TreeSHAP values, feature importance and dependence curves. |
+| 05 | Uses half-hourly FLUXNET flux and meteorology files, matched surface temperatures, site heights, local-solar-time offsets and archived growing-season activity flags. Inverts Penman–Monteith at each interval. Forms a daily mean on active days with at least four eligible daytime intervals. | One CSV per station containing daily ΔT (°C), canopy conductance (m s⁻¹), GPP (µmol m⁻² s⁻¹), the interval count and the dominant energy-input tier. |
+| 06 | Reads the prepared FLUXNET site-year anomaly table. Fits the Figure 2 equations with five controls and equal total weight per site, including H → Gc and Gc → LE. Cross-resamples sites and years for interval estimates. | Ridge penalties, standardized coefficients, five path products, their sum, equation R² and intervals. |
+| 07 | Reads prepared annual fields for 12 CMIP6 models under SSP2-4.5 and SSP5-8.5. Estimates pixel-level ΔT sensitivity and uses the annual departure from the model’s 2001–2014 baseline to calculate its contribution to GPP. | Pixel sensitivities, global and regional annual series, model and ensemble endpoints, and recent temperature trends. |
 
-Use the archived annual matrices, or run both preprocessing modes of script 01 and
-read H and LE from the raster inventory. Station mode uses the project daily records
-directly.
+Run each script with Python, for example `python 01_detrend_and_standardize_inputs.py`. The ridge regressions include an unpenalized intercept. Resampling uses 2,000 draws in 02, 03, 04 and 06.
 
-```bash
-python 03_decompose_sensible_and_latent_heat_pathways.py
-python 03_decompose_sensible_and_latent_heat_pathways.py --from-rasters --prepared-root results/01
-python 03_decompose_sensible_and_latent_heat_pathways.py --stations
-```
+## Observational grids
 
-**Output directory** `results/03/`
+GOSIF GPP and GOSIF SIF use 8-day inputs. GloFlux GPP and LHSIF use monthly inputs. For each productivity series with at least five finite years at the same calendar position, 01 excludes values more than three scaled median absolute deviations from the median (scale factor 1.4826, positive dispersion required). The 8-day precipitation and radiation inputs also retain their archived physical range checks.
 
-One CSV per GPP product, or stations.csv for the station fit. In grid mode --point-
-only skips bootstrap P values.
+For CO₂, 01 integrates the original NOAA time series over each 8-day interval or calendar month, interpolates the 41 sine-latitude nodes to the 180 latitude centres and repeats each latitude value across 360 longitudes. The station regressions use site CO₂ measurements.
 
-### 04 Explain observed productivity sensitivity with XGBoost (S12 and S13).
+| Time scale | Output path under `OUTPUT_DIR` | Example filename |
+|---|---|---|
+| 8-day | `8day/<variable>/` | `CO2_2001_DOY009_zscore.tif` |
+| Monthly | `monthly/<variable>/` | `CO2_2001_M02_zscore.tif` |
 
-The inputs directory must contain training_table.csv and training_manifest.json. Use
-XGBoost 1.6.2 with pandas, NumPy, scikit-learn and statsmodels.
+`DOY` is the starting day of the 8-day period (001, 009, …, 361). `M` is the calendar month (01–12). Output values are dimensionless standardized anomalies on the EPSG:4326 grid. Missing values and cells outside the vegetation mask are NaN.
 
-```bash
-python 04_explain_productivity_sensitivity_with_xgboost_shap.py
-```
+## Output variables
 
-**Output directory** `results/04/`
+| Field | Quantity |
+|---|---|
+| `S_std` | Standardized sensitivity to ΔT for the named response. The station table in 02 identifies the response and reports its coefficient in `estimate`. |
+| `a_H`, `a_LE`, `b_H`, `b_LE` | Standardized flux responses to ΔT and partial GPP responses to sensible and latent heat flux. |
+| `C_H`, `C_LE`, `S_recon` | The products a_H × b_H and a_LE × b_LE, and their sum. |
+| `delta_t_c`, `gc_m_s` | Physical daytime ΔT in °C and canopy conductance in m s⁻¹ in 05. |
+| `DeltaT_anomaly_2001_2014_C` | Annual all-day ΔT minus the corresponding 2001–2014 mean, in °C. |
+| `DeltaT_anomaly_2081_2100_vs_2001_2014_C` | Pixel mean ΔT in 2081–2100 minus its 2001–2014 mean, in °C. |
+| `S_phys_gC_m2_yr_K`, `GPP_contribution_pct` | Physical GPP sensitivity in g C m⁻² yr⁻¹ K⁻¹ and area-weighted contribution as a percentage of baseline GPP. |
 
-Test predictions and metrics, bootstrap scores, SHAP values and importance, and
-LOWESS curves.
-
-### 05 Calculate daytime FLUXNET canopy conductance for the selected 154 sites.
-
-The source and archive directories provide measurement heights, site identifiers and
-inventories pointing to the half-hourly records and daily GPP. Requires pandas,
-NumPy and PyArrow.
-
-```bash
-python 05_estimate_fluxnet_canopy_conductance.py --site AT-Neu
-python 05_estimate_fluxnet_canopy_conductance.py
-```
-
-**Output directory** `results/05/`
-
-One daily CSV per processed site. Omit --site to process the full cohort before
-using station mode in 02 or rebuilding annual inputs in 06.
-
-### 06 Fit standardized annual FLUXNET ridge path coefficients (Fig. 2e–f).
-
-The default input is locked_input.csv from the Figure 2 release. To rebuild site-
-year inputs, run script 05 for all sites and retain the project daily station
-records.
-
-```bash
-python 06_estimate_fluxnet_sem_path_coefficients.py
-python 06_estimate_fluxnet_sem_path_coefficients.py --gc-folder results/05
-```
-
-**Output directory** `results/06/`
-
-annual_inputs.csv, penalties.csv and coefficients.csv with point estimates and
-bootstrap intervals.
-
-### 07 Reproduce annual CMIP6 DeltaT sensitivities and GPP contributions (Fig. 5, S9, S14, S20–S23).
-
-The inputs directory contains prepared annual historical and scenario NPZ files. The
-selected path identifies the model selection JSON. Regional summaries and recent
-trends require the project spatial and ERA5 reference files.
-
-```bash
-python 07_project_cmip6_delta_t_and_gpp_contributions.py
-```
-
-**Output directory** `results/07/`
-
-Per-model pixel tables, annual.csv, model_endpoints.csv, ensemble_endpoints.csv,
-regional.csv and recent_trends.csv.
-
-## Numerical checks
-
-The held-out test R-squared values for the three XGBoost models round to 0.71, 0.77 and 0.81. For the twelve-model CMIP6 ensemble, the mean DeltaT contributions to GPP in 2081-2100 relative to 2001-2014 round to -2.89% under SSP2-4.5 and -5.91% under SSP5-8.5. These endpoints are available in `results/07/ensemble_endpoints.csv`.

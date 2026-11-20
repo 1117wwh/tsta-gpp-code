@@ -1,38 +1,25 @@
-"""Fit standardized annual FLUXNET ridge path coefficients (Fig. 2e–f).
+"""Estimate the Figure 2 paths from FLUXNET site-year anomalies, with equal weight per site and crossed site–year bootstrap intervals."""
 
-TSO in the input denotes DeltaT. H and LE predict Gc; GPP depends on
-DeltaT, H, LE and Gc. All four equations include five controls. Fit each
-equation to equal-site-weight anomalies, then estimate path products and the
-H–LE residual correlation. Crossed site/year bootstrap intervals condition
-on the selected penalties. Inputs are the accepted annual anomalies, or run
---gc-folder results/05 to rebuild them from the daily physical variables.
-
-Inputs
-------
-The default input is locked_input.csv from the Figure 2 release. To rebuild site-
-year inputs, run script 05 for all sites and retain the project daily station
-records.
-
-Run from the directory containing this script
---------------------------------------------
-    python 06_estimate_fluxnet_sem_path_coefficients.py
-    python 06_estimate_fluxnet_sem_path_coefficients.py --gc-folder results/05
-
-Outputs in results/06
----------------------
-annual_inputs.csv, penalties.csv and coefficients.csv with point estimates and
-bootstrap intervals.
-"""
-
+import json
 from pathlib import Path
 import numpy as np
 import pandas as pd
 
 
+PATHS_FILE = Path(__file__).resolve().parent / "06_data_paths.txt"
+
+
+controls = ["Ta", "TP", "SSRD", "CO2", "VPD"]
+equations = {
+    "H": ["DeltaT"],
+    "LE": ["DeltaT", "Gc"],
+    "Gc": ["H"],
+    "GPP": ["DeltaT", "H", "LE", "Gc"],
+}
+
+
 def standardize(values, weights):
-    """Center and scale each variable across site-years using the supplied observation
-    weights.
-    """
+    """Center and scale across site-years with equal total weight per site."""
     mean = np.average(values, weights=weights, axis=0)
     residual = values - mean
     variance = np.average(residual**2, weights=weights, axis=0)
@@ -68,12 +55,9 @@ def select_penalty(x, y, weights, year):
 
 
 def estimate(data, weights, penalties):
-    """Return standardized paths, path products, equation R-squared values and the H-LE
-    residual correlation.
-    """
+    """Return standardized paths, five path products and equation R-squared values."""
     z = pd.DataFrame(standardize(data.to_numpy(), weights), columns=data.columns)
     results = {}
-    residuals = {}
     for target, parents in equations.items():
         x = z[parents + controls].to_numpy()
         y = z[target].to_numpy()
@@ -81,18 +65,14 @@ def estimate(data, weights, penalties):
         for predictor, slope in zip(parents + controls, slopes):
             results[f"{predictor}_to_{target}"] = slope
         error = y - intercept - x @ slopes
-        residuals[target] = error
         results["R2_" + target] = 1 - np.average(error**2, weights=weights)
-    covariance = np.average(residuals["H"] * residuals["LE"], weights=weights)
-    results["H_LE_residual_correlation"] = covariance / np.sqrt(
-        (1 - results["R2_H"]) * (1 - results["R2_LE"])
-    )
+    # Figure 2f, bars A to E, in displayed order.
     paths = [
-        ("TSO", "H", "Gc", "GPP"),
-        ("TSO", "H", "GPP"),
-        ("TSO", "LE", "Gc", "GPP"),
-        ("TSO", "LE", "GPP"),
-        ("TSO", "GPP"),
+        ("DeltaT", "GPP"),
+        ("DeltaT", "H", "GPP"),
+        ("DeltaT", "LE", "GPP"),
+        ("DeltaT", "H", "Gc", "GPP"),
+        ("DeltaT", "H", "Gc", "LE", "GPP"),
     ]
     for path in paths:
         results["C_" + "_".join(path)] = np.prod(
@@ -102,60 +82,10 @@ def estimate(data, weights, penalties):
     return results
 
 
-def annual_anomalies(gc_folder):
-    """Match the physical variables by day before station-year averaging."""
-    variables = ["TSO", "GPP", "H", "LE", "Gc"] + controls
-    stage = root / "Figure2_preparation_20261028"
-    original_years = pd.read_csv(
-        stage / "20261028_all_daylight_annual_ridge_S27/annual_raw_common_day_means.csv",
-        usecols=["site", "year"],
-    )
-    sites = pd.read_csv(
-        root
-        / "Figure_releases_20261029/Figure_01/20261029_154sites/station_analysis/station_GPP_Gc_AI.csv"
-    ).site
-    records = []
-    for site in sorted(sites):
-        days = pd.read_csv(
-            stage / f"20261028_all_daylight_processed_S27/stations/{site}.csv",
-            float_precision="round_trip",
-        )
-        gc = pd.read_csv(gc_folder / f"{site}.csv", float_precision="round_trip").set_index("date")
-        days["Gc"] = days.date.map(gc.gc_m_s)
-        days = days.rename(columns={"DeltaT": "TSO"}).merge(
-            original_years, on=["site", "year"], validate="many_to_one"
-        )
-        retained = days.loc[np.isfinite(days[variables]).all(axis=1)]
-        groups = retained.groupby("year")
-        annual = groups[variables].mean()
-        annual["n_days"] = groups.size()
-        annual = annual[annual.n_days >= 2].copy()
-        if len(annual) < 2:
-            continue
-        dates = pd.to_datetime(annual.index.astype(str) + "-07-01")
-        elapsed = np.asarray((dates - dates.min()).days) / 365.2425
-        time = (elapsed - elapsed.mean()) / elapsed.std(ddof=1)
-        design = np.column_stack([np.ones(len(time)), time])
-        values = annual[variables].to_numpy()
-        residual = values - design @ np.linalg.lstsq(design, values, rcond=None)[0]
-        scale = residual.std(axis=0, ddof=1)
-        if (scale < 1e-12).any():
-            continue
-        annual[variables] = (residual - residual.mean(0)) / scale
-        records.append(annual.assign(site=site).reset_index())
-    return pd.concat(records, ignore_index=True)
-
-
-def main():
-    """Fit four annual equations and write the input table, penalties, coefficients and
-    crossed site/year bootstrap intervals.
-    """
-    frame = (
-        annual_anomalies(gc_folder)
-        if gc_folder
-        else pd.read_csv(input_file, float_precision="round_trip")
-    )
-    data = frame[["TSO", "GPP", "H", "LE", "Gc"] + controls]
+def fit_paths(frame, output):
+    """Fit four equations and resample sites and years independently with fixed penalties."""
+    variables = ["DeltaT", "GPP", "H", "LE", "Gc"] + controls
+    data = frame[variables]
     year, year_id = np.unique(frame.year, return_inverse=True)
     site, site_id, counts = np.unique(frame.site, return_inverse=True, return_counts=True)
     weights = 1 / counts[site_id]
@@ -166,36 +96,25 @@ def main():
             z[parents + controls].values, z[target].values, weights, frame.year
         )
     output.mkdir(parents=True, exist_ok=True)
-    frame.to_csv(output / "annual_inputs.csv", index=False)
     point = estimate(data, weights, penalties)
     draws = []
     rng = np.random.default_rng(20261018)
-    for _ in range(1999):
+    # Crossed bootstrap: multiply each site-year weight by its site and year draw counts.
+    for _ in range(2000):
         years = rng.multinomial(len(year), np.full(len(year), 1 / len(year)))
         sites = rng.multinomial(len(site), np.full(len(site), 1 / len(site)))
         draws.append(estimate(data, weights * years[year_id] * sites[site_id], penalties))
     limits = pd.DataFrame(draws).quantile([0.025, 0.975]).T
     limits.columns = ["ci_low", "ci_high"]
     limits["estimate"] = pd.Series(point)
-    output.mkdir(parents=True, exist_ok=True)
     limits.rename_axis("metric").to_csv(output / "coefficients.csv")
     pd.Series(penalties, name="lambda").to_csv(output / "penalties.csv")
 
 
 if __name__ == "__main__":
-    root = Path(__file__).resolve().parents[1]
-    input_file = (
-        root
-        / "Figure_releases_20261029/Figure_02/20261029_154sites/inputs/SEM/controlled_ridge/locked_input.csv"
-    )
-    output = Path(__file__).parent / "results/06"
-    controls = ["Ta", "TP", "SSRD", "CO2", "VPD"]
-    equations = {"H": ["TSO"], "LE": ["TSO"], "Gc": ["H", "LE"], "GPP": ["TSO", "H", "LE", "Gc"]}
-    import argparse
+    paths = json.loads(PATHS_FILE.read_text(encoding="utf-8-sig"))
+    STATION_ANNUAL_ANOMALIES_PATH = PATHS_FILE.parent / paths["STATION_ANNUAL_ANOMALIES_PATH"]
+    OUTPUT_DIR = PATHS_FILE.parent / paths["OUTPUT_DIR"]
 
-    parser = argparse.ArgumentParser()
-    parser.add_argument(
-        "--gc-folder", type=Path, help="Rebuild annual inputs from the daily results of script 05"
-    )
-    gc_folder = parser.parse_args().gc_folder
-    main()
+    annual = pd.read_csv(STATION_ANNUAL_ANOMALIES_PATH, float_precision="round_trip")
+    fit_paths(annual, OUTPUT_DIR)

@@ -1,51 +1,25 @@
-"""Calculate daytime FLUXNET canopy conductance for the selected 154 sites.
+"""Estimate daytime canopy conductance (Gc, m/s) from FLUXNET half-hourly records and average eligible intervals by site and day."""
 
-Read half-hourly flux and temperature records, station measurement heights
-and daily GPP. Use Penman–Monteith inversion, a 24-hour dry window and
-06:00–18:00 local mean solar time. Apply the site-year activity criterion
-(daily GPP above 25% of its annual 95th percentile) before daily averaging.
-Daily Gc is in m/s; each daily value requires at least four eligible intervals.
-Use --site AT-Neu to run one site. Outputs feed scripts 02 and 06.
-
-Inputs
-------
-The source and archive directories provide measurement heights, site identifiers and
-inventories pointing to the half-hourly records and daily GPP. Requires pandas,
-NumPy and PyArrow.
-
-Run from the directory containing this script
---------------------------------------------
-    python 05_estimate_fluxnet_canopy_conductance.py --site AT-Neu
-    python 05_estimate_fluxnet_canopy_conductance.py
-
-Outputs in results/05
----------------------
-One daily CSV per processed site. Omit --site to process the full cohort before
-using station mode in 02 or rebuilding annual inputs in 06.
-"""
-
-from pathlib import Path
-import json, argparse
+from pathlib import Path, PureWindowsPath
+import json
 import numpy as np
 import pandas as pd
 import pyarrow as pa
 import pyarrow.csv as pc
 
+
+PATHS_FILE = Path(__file__).resolve().parent / "05_data_paths.txt"
+
 CP = 1004.67
-
 RD = 287.05
-
-RGAS = 8.314462618
-
 EPSILON = 0.622
-
 LAMBDA_V = 2.45e6
-
 KARMAN = 0.40
 
 COMMON_COLUMNS = [
     "TIMESTAMP_START",
     "TIMESTAMP_END",
+    "GPP_NT_VUT_REF",
     "TA_F_MDS",
     "VPD_F_MDS",
     "PA",
@@ -53,10 +27,8 @@ COMMON_COLUMNS = [
     "WS",
     "WS_F",
     "USTAR",
-    "SW_IN_F_MDS",
     "P",
     "P_F",
-    "RH",
     "NETRAD",
     "G_F_MDS",
     "LE_CORR",
@@ -68,7 +40,6 @@ COMMON_COLUMNS = [
     "H_F_MDS_QC",
     "TA_F_MDS_QC",
     "VPD_F_MDS_QC",
-    "SW_IN_F_MDS_QC",
 ]
 
 
@@ -88,18 +59,16 @@ def field_numeric(frame: pd.DataFrame, name: str) -> pd.Series:
 def safe_fallback(
     frame: pd.DataFrame, preferred: str, fallback: str
 ) -> tuple[pd.Series, pd.Series]:
-    """Fill missing values from a second field and return the source field used for each
-    observation.
-    """
-    a = numeric(frame[preferred]) if preferred in frame else pd.Series(np.nan, index=frame.index)
-    b = numeric(frame[fallback]) if fallback in frame else pd.Series(np.nan, index=frame.index)
+    """Use the fallback only where the preferred field is missing."""
+    a = field_numeric(frame, preferred)
+    b = field_numeric(frame, fallback)
     use_a = a.notna()
     return a.fillna(b), pd.Series(
         np.where(use_a, preferred, np.where(b.notna(), fallback, "missing")), index=frame.index
     )
 
 
-def pm_components(
+def invert_penman_monteith(
     ta_c: pd.Series,
     vpd_hpa: pd.Series,
     pa_kpa: pd.Series,
@@ -107,9 +76,7 @@ def pm_components(
     energy: pd.Series,
     ga_m_s: pd.Series,
 ) -> pd.DataFrame:
-    """Invert Penman-Monteith and return its denominator and conductance in m/s and mol
-    per square metre per second.
-    """
+    """Invert Penman–Monteith for canopy conductance in m/s."""
     ta = ta_c.to_numpy(dtype=float)
     vpd_pa = vpd_hpa.to_numpy(dtype=float) * 100.0
     pressure_pa = pa_kpa.to_numpy(dtype=float) * 1000.0
@@ -118,55 +85,38 @@ def pm_components(
     ga = ga_m_s.to_numpy(dtype=float)
     temp_k = ta + 273.15
     svp_kpa = 0.6108 * np.exp(17.27 * ta / (ta + 237.3))
-    delta = 4098.0 * svp_kpa / ((ta + 237.3) ** 2) * 1000.0
+    svp_slope_pa_per_k = 4098.0 * svp_kpa / ((ta + 237.3) ** 2) * 1000.0
     gamma = CP * pressure_pa / (EPSILON * LAMBDA_V)
     rho = pressure_pa / (RD * temp_k)
-    denominator = delta * available + rho * CP * vpd_pa * ga - latent * (delta + gamma)
+    denominator = (
+        svp_slope_pa_per_k * available
+        + rho * CP * vpd_pa * ga
+        - latent * (svp_slope_pa_per_k + gamma)
+    )
     with np.errstate(divide="ignore", invalid="ignore", over="ignore"):
-        gs_m_s = gamma * ga * latent / denominator
-        gs_mol = gs_m_s * pressure_pa / (RGAS * temp_k)
+        gc_m_s = gamma * ga * latent / denominator
     return pd.DataFrame(
         {
             "pm_denominator": denominator,
-            "gs_m_s": gs_m_s,
-            "gs_mol_m2_s": gs_mol,
+            "gc_m_s": gc_m_s,
         },
         index=ta_c.index,
     )
 
 
-def fu_aerodynamic(
-    ws: pd.Series,
-    ustar: pd.Series,
-    zm_m: float,
-    h_meta_m: float,
-    h_source_label: str = "",
-) -> tuple[pd.Series, pd.Series, pd.Series, pd.Series, str]:
-    """Return conductance, resistance, canopy height, geometry validity and the height
-    source for the near-neutral estimate.
-    """
-    wind = ws.to_numpy(dtype=float)
-    # h_meta_m is a single, site-level HEIGHTC or near-neutral Eq. 5 estimate.
-    # It must not be recalculated row by row: doing so algebraically collapses
-    # the Fu resistance toward the USTAR^2/WS approximation.
-    h = np.full_like(
-        wind, h_meta_m if np.isfinite(h_meta_m) and h_meta_m > 0 else np.nan, dtype=float
-    )
-    h_source = h_source_label or "site_level_resolved_canopy_height"
+def aerodynamic_conductance(wind_speed, measurement_height_m, canopy_height_m):
+    """Use site canopy height and wind speed in the near-neutral logarithmic profile."""
+    wind = wind_speed.to_numpy(dtype=float)
+    h = canopy_height_m
+    zm_m = measurement_height_m
     zd = 0.67 * h
     z0 = 0.10 * h
     geometry = np.isfinite(zm_m) & (zm_m > 0) & np.isfinite(h) & (h > 0) & (zm_m > zd + z0)
     with np.errstate(divide="ignore", invalid="ignore", over="ignore"):
         ra = np.log((zm_m - zd) / z0) ** 2 / (wind * KARMAN**2)
         ga = 1.0 / ra
-    geometry &= np.isfinite(ra) & (ra > 0) & np.isfinite(ga) & (ga > 0)
-    return (
-        pd.Series(ga, index=ws.index),
-        pd.Series(ra, index=ws.index),
-        pd.Series(h, index=ws.index),
-        pd.Series(geometry, index=ws.index),
-        h_source,
-    )
+    geometry = geometry & np.isfinite(ra) & (ra > 0) & np.isfinite(ga) & (ga > 0)
+    return pd.Series(ga, index=wind_speed.index), pd.Series(geometry, index=wind_speed.index)
 
 
 def parse_timestamp(series: pd.Series) -> pd.Series:
@@ -210,9 +160,7 @@ def choose_energy_tier(frame: pd.DataFrame) -> tuple[pd.Series, pd.Series, pd.Se
     ]
     unassigned = pd.Series(True, index=idx)
     for label, candidate_le, candidate_energy in candidates:
-        # Fallback is triggered by missing/non-finite inputs only. A present
-        # but non-positive LE, low energy, failed PM denominator, or outlying
-        # Gc is screened later and is never rescued by changing methods.
+        # Select the first tier with complete energy inputs before applying physical limits.
         available = (
             unassigned
             & candidate_le.notna()
@@ -230,8 +178,8 @@ def choose_energy_tier(frame: pd.DataFrame) -> tuple[pd.Series, pd.Series, pd.Se
 def read_columns(path, columns):
     """Read requested fields present in a station CSV and preserve integer timestamps."""
     header = pd.read_csv(path, nrows=0).columns
-    use = [x for x in columns if x in header]
-    types = {x: pa.int64() if x.startswith("TIMESTAMP") else pa.float64() for x in use}
+    use = [name for name in columns if name in header]
+    types = {name: pa.int64() if name.startswith("TIMESTAMP") else pa.float64() for name in use}
     return pc.read_csv(
         path,
         read_options=pc.ReadOptions(use_threads=False),
@@ -241,57 +189,45 @@ def read_columns(path, columns):
     ).to_pandas()
 
 
-def active_dates(daily_file):
-    """Return dates in 2001-2023 when GPP exceeds one quarter of the positive site-year
-    95th percentile.
-    """
-    data = pd.read_csv(daily_file, usecols=["TIMESTAMP", "GPP_NT_VUT_REF"])
-    dates = pd.to_datetime(data.TIMESTAMP.astype(str), format="%Y%m%d")
-    gpp = data.GPP_NT_VUT_REF.where(data.GPP_NT_VUT_REF.abs() < 9000)
-    p95 = gpp.groupby(dates.dt.year).transform("quantile", q=0.95)
-    return set(
-        dates[(p95 > 0) & (gpp > 0.25 * p95) & dates.dt.year.between(2001, 2023)].dt.strftime(
-            "%Y-%m-%d"
-        )
-    )
-
-
-def calculate_site(sid, height, daily_file, metadata):
-    """Align and screen half-hourly observations and return daily conductance for active
-    days with at least four eligible intervals.
-    """
-    hh = Path(metadata["hh_source"])
-    ls = Path(metadata["lst_source"])
-    shift = metadata["clock_to_LMST_hours"]
-    header = pd.read_csv(hh, nrows=0).columns
+def screen_flux_records(site, flux_file):
+    """Apply the quality flags for the pressure, wind and rain measurements used."""
+    header = pd.read_csv(flux_file, nrows=0).columns
     extra_flags = [
         c for c in header if c.endswith("_QC") and c.startswith(("LW_", "PA", "WS", "P_", "USTAR"))
     ]
-    fields = list(dict.fromkeys(COMMON_COLUMNS + ["GPP_NT_VUT_REF", "TA_F"] + extra_flags))
-    d = read_columns(hh, fields).replace(-9999, np.nan)
-    assert d.TIMESTAMP_START.is_unique
-    assert (
-        (parse_timestamp(d.TIMESTAMP_END) - parse_timestamp(d.TIMESTAMP_START))
+    fields = COMMON_COLUMNS + extra_flags
+    frame = read_columns(flux_file, fields).replace(-9999, np.nan)
+    if not frame.TIMESTAMP_START.is_unique:
+        raise ValueError(f"Duplicate flux timestamps at {site}")
+    if not (
+        (parse_timestamp(frame.TIMESTAMP_END) - parse_timestamp(frame.TIMESTAMP_START))
         .eq(pd.Timedelta(minutes=30))
         .all()
-    )
-    d["GPP_NT_VUT_REF"] = d.GPP_NT_VUT_REF.where(d.GPP_NT_VUT_REF.between(0, 30000))
+    ):
+        raise ValueError(f"Expected half-hourly flux intervals at {site}")
+    frame["GPP_NT_VUT_REF"] = frame.GPP_NT_VUT_REF.where(frame.GPP_NT_VUT_REF.between(0, 30000))
     for name in ["P_F", "P"]:
-        if name in d:
-            invalid = d[name].lt(0)
-            if name + "_QC" in d:
-                invalid |= d[name + "_QC"].eq(3)
-            d[name] = d[name].mask(invalid)
-    extra_qc = pd.Series(True, index=d.index)
+        if name in frame:
+            invalid = frame[name].lt(0)
+            if name + "_QC" in frame:
+                invalid |= frame[name + "_QC"].eq(3)
+            frame[name] = frame[name].mask(invalid)
+    extra_qc = pd.Series(True, index=frame.index)
     for a, b in [("PA_F", "PA"), ("WS_F", "WS")]:
-        _, source = safe_fallback(d, a, b)
+        _, source = safe_fallback(frame, a, b)
         for name in [a, b]:
-            if name + "_QC" in d:
-                extra_qc &= ~(source.eq(name) & d[name + "_QC"].eq(3))
-    if "USTAR_QC" in d:
-        extra_qc &= ~d.USTAR_QC.eq(3)
-    lst = pd.read_csv(ls)
-    assert lst.TIMESTAMP_START.is_unique
+            if name + "_QC" in frame:
+                extra_qc &= ~(source.eq(name) & frame[name + "_QC"].eq(3))
+    if "USTAR_QC" in frame:
+        extra_qc &= ~frame.USTAR_QC.eq(3)
+    return frame, extra_qc
+
+
+def surface_temperature(site, temperature_file, frame):
+    """Align temperatures with valid emissivity and longwave fluxes to flux timestamps."""
+    lst = pd.read_csv(temperature_file)
+    if not lst.TIMESTAMP_START.is_unique:
+        raise ValueError(f"Duplicate surface temperature timestamps at {site}")
     good = (
         np.isfinite(lst.LST)
         & lst.LST.gt(-273.15)
@@ -300,7 +236,7 @@ def calculate_site(sid, height, daily_file, metadata):
         & lst.LW_IN.gt(0)
         & lst.LW_OUT.gt(0)
     )
-    quality = d.set_index("TIMESTAMP_START")
+    quality = frame.set_index("TIMESTAMP_START")
     for field in ["LW_IN_COL", "LW_OUT_COL"]:
         for name in lst[field].dropna().unique():
             if name + "_QC" in quality:
@@ -308,10 +244,28 @@ def calculate_site(sid, height, daily_file, metadata):
                     lst[field].eq(name) & lst.TIMESTAMP_START.map(quality[name + "_QC"]).eq(3)
                 )
     spikes = {"CA-Cbo": 201410301100, "FR-LBr": 200412101100, "US-EML": 202107091030}
-    good &= lst.TIMESTAMP_START.ne(spikes.get(sid, -1))
-    lst_c = d.TIMESTAMP_START.map(lst.set_index("TIMESTAMP_START").LST.where(good.to_numpy()))
-    frame = d
-    idx = frame.index
+    good &= lst.TIMESTAMP_START.ne(spikes.get(site, -1))
+    return frame.TIMESTAMP_START.map(lst.set_index("TIMESTAMP_START").LST.where(good.to_numpy()))
+
+
+def flux_quality(frame, tier):
+    """Apply quality flags only to fields used by the chosen energy tier."""
+    valid = pd.Series(True, index=frame.index)
+    for name in ("TA_F_MDS_QC", "VPD_F_MDS_QC"):
+        valid &= ~field_numeric(frame, name).eq(3)
+    uses_ground_heat = tier.isin(["T1_corrLE_RnG", "T2_rawLE_RnG"])
+    uses_raw_le = tier.isin(["T2_rawLE_RnG", "T4_rawLE_rawLEplusH"])
+    uses_raw_h = tier.eq("T4_rawLE_rawLEplusH")
+    valid &= ~(uses_ground_heat & field_numeric(frame, "G_F_MDS_QC").eq(3))
+    valid &= ~(uses_raw_le & field_numeric(frame, "LE_F_MDS_QC").eq(3))
+    valid &= ~(uses_raw_h & field_numeric(frame, "H_F_MDS_QC").eq(3))
+    return valid
+
+
+def calculate_half_hours(site, height, activity_file, flux_file, temperature_file, shift):
+    """Invert Penman–Monteith for each eligible half-hour on active growing-season days."""
+    frame, meteorology_qc = screen_flux_records(site, flux_file)
+    lst_c = surface_temperature(site, temperature_file, frame)
     timestamp = parse_timestamp(frame["TIMESTAMP_START"])
     timestamp = (
         timestamp
@@ -332,41 +286,13 @@ def calculate_site(sid, height, daily_file, metadata):
     gpp = field_numeric(frame, "GPP_NT_VUT_REF")
     le, energy, tier = choose_energy_tier(frame)
 
-    qc_base = pd.Series(True, index=idx)
-    for col in ["TA_F_MDS_QC", "VPD_F_MDS_QC"]:
-        if col in frame.columns:
-            q = field_numeric(frame, col)
-            if q.notna().any():
-                qc_base &= ~q.eq(3)
-    # G QC is relevant only when Rn-G is used. Raw turbulent fallback uses
-    # the available LE/H QC fields when those flags exist.
-    uses_rng = tier.isin(["T1_corrLE_RnG", "T2_rawLE_RnG"])
-    if "G_F_MDS_QC" in frame.columns:
-        q = field_numeric(frame, "G_F_MDS_QC")
-        if q.notna().any():
-            qc_base &= (~uses_rng) | (~q.eq(3))
-    uses_raw = tier.eq("T4_rawLE_rawLEplusH")
-    for col in ["LE_F_MDS_QC", "H_F_MDS_QC"]:
-        if col in frame.columns:
-            q = field_numeric(frame, col)
-            if q.notna().any():
-                uses_field = (
-                    tier.isin(["T2_rawLE_RnG", "T4_rawLE_rawLEplusH"])
-                    if col == "LE_F_MDS_QC"
-                    else uses_raw
-                )
-                qc_base &= (~uses_field) | (~q.eq(3))
-
-    qc_base &= extra_qc
-    ga, _, _, geometry, _ = fu_aerodynamic(
-        wind,
-        ustar,
-        height.wind_measurement_height_m,
-        height.canopy_height_used_m,
-        height.previous_canopy_height_source,
+    quality = meteorology_qc & flux_quality(frame, tier)
+    ga, geometry = aerodynamic_conductance(
+        wind, height.wind_measurement_height_m, height.canopy_height_used_m
     )
-    pm = pm_components(ta, vpd, pa, le, energy, ga)
-    tts = lst_c - ta
+    pm = invert_penman_monteith(ta, vpd, pa, le, energy, ga)
+    delta_t_c = lst_c - ta
+    # A daytime midpoint must follow 24 rain-free hours and satisfy the inversion limits.
     mask = (
         timestamp.notna()
         & minute.ge(360)
@@ -377,35 +303,41 @@ def calculate_site(sid, height, daily_file, metadata):
         & wind.gt(0.1)
         & ustar.gt(0.1)
         & rain_24_mask(frame)
-        & qc_base
+        & quality
         & geometry
         & tier.ne("none")
         & le.gt(0)
         & energy.gt(50)
         & np.isfinite(pm["pm_denominator"])
         & pm["pm_denominator"].gt(0)
-        & np.isfinite(pm["gs_m_s"])
-        & pm["gs_m_s"].gt(0)
-        & pm["gs_m_s"].le(0.05)
-        & tts.notna()
+        & np.isfinite(pm["gc_m_s"])
+        & pm["gc_m_s"].gt(0)
+        & pm["gc_m_s"].le(0.05)
+        & delta_t_c.notna()
         & gpp.notna()
         & np.isfinite(gpp)
     )
-    # Apply the site-year GPP activity threshold before daily aggregation.
-    mask &= timestamp.dt.strftime("%Y-%m-%d").isin(active_dates(daily_file))
-    x = pd.DataFrame(
+    # The archived activity flag uses daily GPP > 25% of the positive site-year GPP P95.
+    activity = pd.read_csv(activity_file, usecols=["date", "activity_day"], dtype={"activity_day": bool})
+    active_dates = activity.loc[activity["activity_day"], "date"]
+    date = timestamp.dt.strftime("%Y-%m-%d")
+    mask &= date.isin(active_dates)
+    return pd.DataFrame(
         {
-            "timestamp": timestamp,
-            "date": timestamp.dt.strftime("%Y-%m-%d"),
-            "tts_c": tts,
-            "gc_m_s": pm["gs_m_s"],
+            "timestamp_start": frame["TIMESTAMP_START"],
+            "date": date,
+            "delta_t_c": delta_t_c,
+            "gc_m_s": pm["gc_m_s"],
             "gpp_umol_m2_s": gpp,
             "tier": tier,
         }
-    ).loc[mask]
+    ).loc[mask].set_index("timestamp_start")
 
-    daily = x.groupby("date").agg(
-        tts_c=("tts_c", "mean"),
+
+def daily_means(half_hours):
+    """Keep days with at least four eligible local daytime intervals."""
+    daily = half_hours.groupby("date").agg(
+        delta_t_c=("delta_t_c", "mean"),
         gc_m_s=("gc_m_s", "mean"),
         gpp_umol_m2_s=("gpp_umol_m2_s", "mean"),
         n_halfhour=("tier", "size"),
@@ -415,26 +347,24 @@ def calculate_site(sid, height, daily_file, metadata):
 
 
 if __name__ == "__main__":
-    folder = Path(__file__).resolve().parent
-    archive = folder.parent / "Figure_releases_20261029"
-    source = Path("D:/DATA/DeltaT_GPP_Analysis/Results/Temporary")
-    heights = pd.read_csv(
-        source / "20261023_S02_station_SEM_sensitivity_sign/Gc_H_LE_source_inventory.csv"
-    ).set_index("site")
-    sites = pd.read_csv(
-        archive / "Figure_01/20261029_154sites/station_analysis/station_GPP_Gc_AI.csv"
-    ).site
-    output = folder / "results/05"
-    output.mkdir(parents=True, exist_ok=True)
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--site", choices=list(sites))
-    args = parser.parse_args()
-    for site in [args.site] if args.site else sites:
-        metadata = json.loads(
-            (source / f"20261023_S01_station_8day_daytime_ridge_VPD/qc/{site}.json").read_text()
+    paths = json.loads(PATHS_FILE.read_text(encoding="utf-8-sig"))
+    STATION_COHORT_PATH = PATHS_FILE.parent / paths["STATION_COHORT_PATH"]
+    STATION_HEIGHTS_PATH = PATHS_FILE.parent / paths["STATION_HEIGHTS_PATH"]
+    HALF_HOURLY_METADATA_DIR = PATHS_FILE.parent / paths["HALF_HOURLY_METADATA_DIR"]
+    STATION_ACTIVITY_DIR = PATHS_FILE.parent / paths["STATION_ACTIVITY_DIR"]
+    HALF_HOURLY_STATIONS_DIR = PATHS_FILE.parent / paths["HALF_HOURLY_STATIONS_DIR"]
+    OUTPUT_DIR = PATHS_FILE.parent / paths["OUTPUT_DIR"]
+
+    heights = pd.read_csv(STATION_HEIGHTS_PATH).set_index("site")
+    sites = pd.read_csv(STATION_COHORT_PATH, usecols=["site"]).site
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    for site in sites:
+        flux_metadata = json.loads((HALF_HOURLY_METADATA_DIR / f"{site}.json").read_text(encoding="utf-8-sig"))
+        site_dir = HALF_HOURLY_STATIONS_DIR / site
+        flux_file = site_dir / PureWindowsPath(flux_metadata["hh_source"]).name
+        temperature_file = site_dir / PureWindowsPath(flux_metadata["lst_source"]).name
+        half_hours = calculate_half_hours(
+            site, heights.loc[site], STATION_ACTIVITY_DIR / f"{site}.csv", flux_file, temperature_file,
+            flux_metadata["clock_to_LMST_hours"],
         )
-        daily_file = json.loads(
-            (archive / f"Shared_Gc_activity_20261029/qc/{site}.json").read_text()
-        )["source_DD"]
-        daily = calculate_site(site, heights.loc[site], daily_file, metadata)
-        daily.to_csv(output / f"{site}.csv")
+        daily_means(half_hours).to_csv(OUTPUT_DIR / f"{site}.csv")

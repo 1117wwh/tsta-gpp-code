@@ -5,6 +5,7 @@ authors:
   - family-names: Wang
     given-names: Wenhao
 doi: 10.5281/zenodo.21276954
-date-released: 2026-10-14
+version: 4.0.0
+date-released: 2026-11-20
 url: "https://github.com/1117wwh/tsta-gpp-code"
 license: MIT

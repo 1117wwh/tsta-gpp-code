@@ -1,0 +1,6 @@
+/*.py -text
+/README.md text eol=lf
+/.gitattributes export-ignore
+/.gitignore export-ignore
+/CITATION.cff export-ignore
+/LICENSE export-ignore
